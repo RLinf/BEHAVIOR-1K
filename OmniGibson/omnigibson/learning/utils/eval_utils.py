@@ -9,9 +9,9 @@ ROBOT_CAMERA_NAMES = {
         "wrist": "external::wrist_camera",
     },
     "R1Pro": {
-        "left_wrist": "robot_r1::robot_r1:left_realsense_link:Camera:0",
-        "right_wrist": "robot_r1::robot_r1:right_realsense_link:Camera:0",
-        "head": "robot_r1::robot_r1:zed_link:Camera:0",
+        "left_wrist": "robot::robot:left_realsense_link:Camera:0",
+        "right_wrist": "robot::robot:right_realsense_link:Camera:0",
+        "head": "robot::robot:zed_link:Camera:0",
     },
 }
 
