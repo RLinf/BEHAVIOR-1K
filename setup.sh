@@ -17,6 +17,7 @@ ACCEPT_CONDA_TOS=false
 ACCEPT_NVIDIA_EULA=false
 ACCEPT_DATASET_TOS=false
 CONFIRM_NO_CONDA=false
+USE_UV=false
 
 [ "$#" -eq 0 ] && HELP=true
 
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --accept-nvidia-eula) ACCEPT_NVIDIA_EULA=true; shift ;;
         --accept-dataset-tos) ACCEPT_DATASET_TOS=true; shift ;;
         --confirm-no-conda) CONFIRM_NO_CONDA=true; shift ;;
+        --use-uv) USE_UV=true; shift ;;
         *) echo "Unknown option: \$1"; exit 1 ;;
     esac
 done
@@ -62,6 +64,7 @@ Options:
   --accept-nvidia-eula    Automatically accept NVIDIA Isaac Sim EULA
   --accept-dataset-tos    Automatically accept BEHAVIOR Dataset Terms
   --confirm-no-conda      Skip confirmation prompt when not in a conda environment
+  --use-uv                Runs the setup using the uv package manager
 
 Example: ./setup.sh --new-env --omnigibson --bddl --joylo --dataset
 Example (non-interactive): ./setup.sh --new-env --omnigibson --dataset --accept-conda-tos --accept-nvidia-eula --accept-dataset-tos
@@ -77,6 +80,12 @@ fi
 [ "$NEW_ENV" = true ] && [ "$CONFIRM_NO_CONDA" = true ] && { echo "ERROR: --new-env and --confirm-no-conda are mutually exclusive"; exit 1; }
 
 WORKDIR=$(pwd)
+PIP=pip
+
+if [ "$USE_UV" = true ]; then
+    command -v uv >/dev/null || { echo "ERROR: UV package manager not found"; exit 1; }
+    PIP="uv pip"
+fi
 
 # Check conda environment condition early (unless creating new environment)
 if [ "$NEW_ENV" = false ]; then
@@ -220,7 +229,7 @@ if [ "$NEW_ENV" = true ]; then
     
     # Install numpy and setuptools via pip
     echo "Installing numpy and setuptools..."
-    pip install "numpy<2" "setuptools<=79"
+    $PIP install "numpy<2" "setuptools<=79"
     
     # Install PyTorch via pip with CUDA support
     echo "Installing PyTorch with CUDA $CUDA_VERSION support..."
@@ -228,14 +237,19 @@ if [ "$NEW_ENV" = true ]; then
     # Determine the CUDA version string for pip URL (e.g., cu126, cu124, etc.)
     CUDA_VER_SHORT=$(echo $CUDA_VERSION | sed 's/\.//g')  # e.g. convert 12.6 to 126
     
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu${CUDA_VER_SHORT}
+    $PIP install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu${CUDA_VER_SHORT}
     echo "✓ PyTorch installation completed"
 fi
 # Install BDDL
 if [ "$BDDL" = true ]; then
     echo "Installing BDDL..."
     [ ! -d "bddl" ] && { echo "ERROR: bddl directory not found"; exit 1; }
-    pip install -e "$WORKDIR/bddl"
+    if [ "$USE_UV" = true ]; then
+        # TODO: For some reason bddl installation in dev mode doesn't work
+        $PIP install "$WORKDIR/bddl"
+    else
+        $PIP install -e "$WORKDIR/bddl"
+    fi
 fi
 
 # Install OmniGibson with Isaac Sim
@@ -270,12 +284,16 @@ if [ "$OMNIGIBSON" = true ]; then
         EXTRAS="[${EXTRAS%,}]"
     fi
 
-    pip install -e "$WORKDIR/OmniGibson$EXTRAS"
+    $PIP install -e "$WORKDIR/OmniGibson$EXTRAS"
 
     # Install pre-commit for dev setup
     if [ "$DEV" = true ]; then
         echo "Setting up pre-commit..."
-        conda install -c conda-forge pre-commit -y
+        if [ "$USE_UV" = true ]; then
+            $PIP install pre-commit
+        else
+            conda install -c conda-forge pre-commit -y
+        fi
         cd "$WORKDIR/OmniGibson"
         pre-commit install
         cd "$WORKDIR"
@@ -339,7 +357,7 @@ if [ "$OMNIGIBSON" = true ]; then
             done
             
             echo "Installing Isaac Sim packages..."
-            pip install "${wheel_files[@]}"
+            $PIP install "${wheel_files[@]}"
             rm -rf "$temp_dir"
             
             # Verify installation
@@ -365,23 +383,27 @@ fi
 if [ "$JOYLO" = true ]; then
     echo "Installing JoyLo..."
     [ ! -d "joylo" ] && { echo "ERROR: joylo directory not found"; exit 1; }
-    pip install -e "$WORKDIR/joylo"
+    $PIP install -e "$WORKDIR/joylo"
 fi
 
 # Install Eval
 if [ "$EVAL" = true ]; then
     # get torch version via pip and install corresponding torch-cluster
-    TORCH_VERSION=$(pip show torch | grep Version | cut -d " " -f 2)
-    pip install torch-cluster -f https://data.pyg.org/whl/torch-${TORCH_VERSION}.html
+    TORCH_VERSION=$($PIP show torch | grep Version | cut -d " " -f 2)
+    $PIP install torch-cluster -f https://data.pyg.org/whl/torch-${TORCH_VERSION}.html
     # install av and ffmpeg
-    conda install av "numpy<2" -c conda-forge -y
+    if [ "$USE_UV" = true ]; then
+        $PIP install av "numpy<2"
+    else
+        conda install av "numpy<2" -c conda-forge -y
+    fi
 fi
     
 # Install asset pipeline
 if [ "$ASSET_PIPELINE" = true ]; then
     echo "Installing asset pipeline..."
     [ ! -d "asset_pipeline" ] && { echo "ERROR: asset_pipeline directory not found"; exit 1; }
-    pip install -r "$WORKDIR/asset_pipeline/requirements.txt"
+    $PIP install -r "$WORKDIR/asset_pipeline/requirements.txt"
 fi
 
 # Install datasets
