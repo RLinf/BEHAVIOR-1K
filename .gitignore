@@ -1,0 +1,10 @@
+gha-creds-*.json
+/site
+.vscode
+.DS_Store
+
+# training
+outputs/
+/*.ipynb
+bddl/build
+OmniGibson/appdata
