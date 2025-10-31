@@ -318,7 +318,7 @@ if [ "$OMNIGIBSON" = true ]; then
             for pkg in "${packages[@]}"; do
                 local pkg_name=${pkg%-*}
                 local filename="${pkg}-cp310-none-manylinux_2_34_x86_64.whl"
-                local url="https://pypi.nvidia.com/${pkg_name//_/-}/$filename"
+                local url="https://pypi.nvidia.cn/${pkg_name//_/-}/$filename"
                 local filepath="$temp_dir/$filename"
                 
                 echo "Downloading $pkg..."
