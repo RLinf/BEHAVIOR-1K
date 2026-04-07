@@ -6,5 +6,5 @@ gha-creds-*.json
 # training
 outputs/
 /*.ipynb
-bddl/build
+bddl3/build
 OmniGibson/appdata
