@@ -588,10 +588,17 @@ class Environment(gym.Env, GymObservable, Recreatable):
         for robot in self.robots:
             robot.apply_action(action_dict[robot.name])
 
-    def _post_step(self, action):
-        """Apply the post-sim-step part of an environment step, i.e. grab observations and return the step results."""
-        # Grab observations
-        obs, obs_info = self.get_obs()
+    def _post_step(self, action, get_obs=True):
+        """Apply the post-sim-step part of an environment step.
+
+        Args:
+            action: Action that was applied in `_pre_step`.
+            get_obs (bool): Whether to fetch observations in this step.
+        """
+        # Grab observations only when requested.
+        obs, obs_info = (None, None)
+        if get_obs:
+            obs, obs_info = self.get_obs()
 
         # Step the scene graph builder if necessary
         if self._scene_graph_builder is not None:
@@ -600,11 +607,13 @@ class Environment(gym.Env, GymObservable, Recreatable):
         # Grab reward, done, and info, and populate with internal info
         reward, done, info = self.task.step(self, action)
         self._populate_info(info)
-        info["obs_info"] = obs_info
+        if get_obs:
+            info["obs_info"] = obs_info
 
         if done and self._automatic_reset:
             # Add lost observation to our information dict, and reset
-            info["last_observation"] = obs
+            if get_obs:
+                info["last_observation"] = obs
             obs = self.reset()
 
         # Hacky way to check for time limit info to split terminated and truncated
