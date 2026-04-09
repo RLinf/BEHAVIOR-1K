@@ -42,6 +42,21 @@ from omnigibson.utils.ui_utils import create_module_logger
 log = create_module_logger(module_name=__name__)
 
 
+def _sync_robot_after_pose_override(robot):
+    """Reset robot joints and controller targets after a direct pose override."""
+    robot.keep_still()
+
+    if getattr(robot, "n_joints", 0) > 0:
+        current_joint_positions = robot.get_joint_positions()
+        robot.set_joint_positions(positions=current_joint_positions, drive=False)
+        robot.set_joint_velocities(
+            velocities=th.zeros_like(current_joint_positions),
+            drive=False,
+        )
+
+    robot.keep_still()
+
+
 class BehaviorTask(BaseTask):
     """
     Task for BEHAVIOR
@@ -132,6 +147,10 @@ class BehaviorTask(BaseTask):
 
         # Scene info
         self.scene_name = None
+        self._callback_name = None
+        self._callback_scene = None
+        self._ignored_cross_scene_callbacks = set()
+        self._missing_presampled_pose_warned = False
 
         # Object info
         self.online_object_sampling = online_object_sampling  # bool
@@ -229,6 +248,8 @@ class BehaviorTask(BaseTask):
 
         # Store the scene name
         self.scene_name = env.scene.scene_model if isinstance(env.scene, TraversableScene) else None
+        self._callback_scene = env.scene
+        self._ignored_cross_scene_callbacks.clear()
 
         # Highlight any task relevant objects if requested
         if self.highlight_task_relevant_objs:
@@ -239,12 +260,12 @@ class BehaviorTask(BaseTask):
                     entity.highlighted = True
 
         # Add callbacks to handle internal processing when new systems / objects are added / removed to the scene
-        callback_name = f"{self.activity_name}_refresh"
-        og.sim.add_callback_on_add_obj(name=callback_name, callback=self._update_bddl_scope_from_added_obj)
-        og.sim.add_callback_on_remove_obj(name=callback_name, callback=self._update_bddl_scope_from_removed_obj)
+        self._callback_name = f"{self.activity_name}_scene_{getattr(env.scene, 'idx', None)}_refresh"
+        og.sim.add_callback_on_add_obj(name=self._callback_name, callback=self._update_bddl_scope_from_added_obj)
+        og.sim.add_callback_on_remove_obj(name=self._callback_name, callback=self._update_bddl_scope_from_removed_obj)
 
-        og.sim.add_callback_on_system_init(name=callback_name, callback=self._update_bddl_scope_from_system_init)
-        og.sim.add_callback_on_system_clear(name=callback_name, callback=self._update_bddl_scope_from_system_clear)
+        og.sim.add_callback_on_system_init(name=self._callback_name, callback=self._update_bddl_scope_from_system_init)
+        og.sim.add_callback_on_system_clear(name=self._callback_name, callback=self._update_bddl_scope_from_system_clear)
 
     def reset(self, env):
         super().reset(env)
@@ -253,18 +274,33 @@ class BehaviorTask(BaseTask):
         if self.use_presampled_robot_pose:
             robot = self.get_agent(env)
             presampled_poses = env.scene.get_task_metadata(key="robot_poses")
-            assert (
-                robot.model_name in presampled_poses
-            ), f"{robot.model_name} presampled pose is not found in task metadata; please set use_presampled_robot_pose to False in task config"
-
-            # Select pose based on randomize_presampled_pose flag
-            available_poses = presampled_poses[robot.model_name]
-            if self.randomize_presampled_pose:
-                robot_pose = random.choice(available_poses)
+            if not presampled_poses or robot.model_name not in presampled_poses:
+                if not self._missing_presampled_pose_warned:
+                    log.warning(
+                        "%s presampled pose is not found in task metadata for task %s; "
+                        "falling back to the default reset pose.",
+                        robot.model_name,
+                        self.activity_name,
+                    )
+                    self._missing_presampled_pose_warned = True
+                presampled_poses = None
             else:
-                robot_pose = available_poses[0]  # Use first presampled pose
+                self._missing_presampled_pose_warned = False
 
-            robot.set_position_orientation(robot_pose["position"], robot_pose["orientation"])
+            if presampled_poses is not None:
+                # Select pose based on randomize_presampled_pose flag
+                available_poses = presampled_poses[robot.model_name]
+                if self.randomize_presampled_pose:
+                    robot_pose = random.choice(available_poses)
+                else:
+                    robot_pose = available_poses[0]  # Use first presampled pose
+
+                robot.set_position_orientation(
+                    robot_pose["position"],
+                    robot_pose["orientation"],
+                    frame="scene",
+                )
+                _sync_robot_after_pose_override(robot)
 
         # Force wake objects
         for obj in self.object_scope.values():
@@ -523,6 +559,8 @@ class BehaviorTask(BaseTask):
         Args:
             obj (BaseObject): Newly imported object
         """
+        if not self._callback_matches_scene(obj, "object.add"):
+            return
         # Iterate over all entities, and if they don't exist, check if any category matches @obj's category, and set it
         # if it does, and immediately return
         for inst, entity in self.object_scope.items():
@@ -538,6 +576,8 @@ class BehaviorTask(BaseTask):
         Args:
             obj (BaseObject): Newly removed object
         """
+        if not self._callback_matches_scene(obj, "object.remove"):
+            return
         # Iterate over all entities, and if they exist, check if any name matches @obj's name, and remove it
         # if it does, and immediately return
         for entity in self.object_scope.values():
@@ -553,6 +593,8 @@ class BehaviorTask(BaseTask):
         Args:
             system (BaseSystem): Newly initialized system
         """
+        if not self._callback_matches_scene(system, "system.init"):
+            return
         # Iterate over all entities, and potentially match the system to the scope
         for inst, entity in self.object_scope.items():
             if not entity.exists and entity.is_system and entity.og_categories[0] == system.name:
@@ -567,11 +609,33 @@ class BehaviorTask(BaseTask):
         Args:
             system (BaseSystem): Newly cleared system
         """
+        if not self._callback_matches_scene(system, "system.clear"):
+            return
         # Iterate over all entities, and potentially remove the matched system from the scope
         for inst, entity in self.object_scope.items():
             if entity.exists and entity.is_system and system.name == entity.name:
                 entity.clear_entity()
                 return
+
+    def _callback_matches_scene(self, source, source_type):
+        if self._callback_scene is None:
+            return True
+
+        source_scene = getattr(source, "scene", None)
+        if source_scene is self._callback_scene:
+            return True
+
+        key = (source_type, getattr(source_scene, "idx", None))
+        if key not in self._ignored_cross_scene_callbacks:
+            self._ignored_cross_scene_callbacks.add(key)
+            log.warning(
+                "Ignoring cross-scene %s callback for task %s: expected scene %s, got scene %s",
+                source_type,
+                self.activity_name,
+                getattr(self._callback_scene, "idx", None),
+                getattr(source_scene, "idx", None),
+            )
+        return False
 
     def show_instruction(self):
         """
