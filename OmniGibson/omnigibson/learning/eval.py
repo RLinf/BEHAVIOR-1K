@@ -272,10 +272,31 @@ class Evaluator:
                 presampled_robot_poses = tro_state
                 robot_pos = presampled_robot_poses[self.robot.model_name][0]["position"]
                 robot_quat = presampled_robot_poses[self.robot.model_name][0]["orientation"]
-                self.robot.set_position_orientation(robot_pos, robot_quat)
+                self.robot.set_position_orientation(
+                    robot_pos,
+                    robot_quat,
+                    frame="scene",
+                )
                 # Write robot poses to scene metadata
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_state)
             else:
+                if (
+                    getattr(self.env.scene, "idx", 0) != 0
+                    and isinstance(tro_state, dict)
+                    and isinstance(tro_state.get("root_link"), dict)
+                    and "pos" in tro_state["root_link"]
+                    and "ori" in tro_state["root_link"]
+                ):
+                    rebased_state = dict(tro_state)
+                    rebased_root_link = dict(tro_state["root_link"])
+                    rebased_pos, rebased_ori = self.env.scene.convert_scene_relative_pose_to_world(
+                        rebased_root_link["pos"],
+                        rebased_root_link["ori"],
+                    )
+                    rebased_root_link["pos"] = rebased_pos
+                    rebased_root_link["ori"] = rebased_ori
+                    rebased_state["root_link"] = rebased_root_link
+                    tro_state = rebased_state
                 self.env.task.object_scope[tro_key].load_state(tro_state, serialized=False)
 
         # Try to ensure that all task-relevant objects are stable
