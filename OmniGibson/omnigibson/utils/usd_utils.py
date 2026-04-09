@@ -1275,7 +1275,7 @@ class ControllableObjectViewAPI:
         assert (
             components[0] == "controllable"
         ), f"Prim path {prim_path} 3rd component does not start with prefix {cls._prefix}__"
-        robot_name_pattern = prim_path.replace(f"/{scene_id}/", "/scene_*/").replace(
+        robot_name_pattern = prim_path.replace(
             f"/{robot_name}", f"/{components[0]}__{components[1]}__*"
         )
         return robot_name_pattern
