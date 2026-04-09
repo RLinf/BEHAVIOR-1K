@@ -614,6 +614,15 @@ class VisionSensor(BaseSensor):
             self._annotators[modality].detach(self._render_product)
             self._annotators[modality] = None
 
+    @staticmethod
+    def _detach_annotator(annotator, render_product):
+        # Some backends accept the render product object directly, while older
+        # ones still require an explicit render-product path list.
+        try:
+            annotator.detach(render_product)
+        except Exception:
+            annotator.detach([render_product.path])
+
     def remove(self):
         # Remove from global sensors dictionary
         self.SENSORS.pop(self.prim_path)
@@ -729,7 +738,8 @@ class VisionSensor(BaseSensor):
 
         # Also update render product and update all annotators
         for annotator in self._annotators.values():
-            annotator.detach([self._render_product.path])
+            if annotator is not None:
+                self._detach_annotator(annotator, self._render_product)
 
         self._render_product.destroy()
         self._render_product = lazy.omni.replicator.core.create.render_product(
@@ -737,7 +747,8 @@ class VisionSensor(BaseSensor):
         )
 
         for annotator in self._annotators.values():
-            annotator.attach([self._render_product])
+            if annotator is not None:
+                annotator.attach([self._render_product])
 
         # Requires 3 updates to propagate changes
         for i in range(3):
@@ -768,7 +779,8 @@ class VisionSensor(BaseSensor):
 
         # Also update render product and update all annotators
         for annotator in self._annotators.values():
-            annotator.detach([self._render_product.path])
+            if annotator is not None:
+                self._detach_annotator(annotator, self._render_product)
 
         self._render_product.destroy()
         self._render_product = lazy.omni.replicator.core.create.render_product(
@@ -776,7 +788,8 @@ class VisionSensor(BaseSensor):
         )
 
         for annotator in self._annotators.values():
-            annotator.attach([self._render_product])
+            if annotator is not None:
+                annotator.attach([self._render_product])
 
         # Requires 3 updates to propagate changes
         for i in range(3):
