@@ -340,12 +340,23 @@ if [ "$OMNIGIBSON" = true ]; then
                 local filepath="$temp_dir/$filename"
                 
                 echo "Downloading $pkg..."
-                if ! curl -sL "$url" -o "$filepath"; then
-                    echo "ERROR: Failed to download $pkg"
-                    rm -rf "$temp_dir"
-                    return 1
+                # If ISAAC_SIM_WHEEL_PATH is set, use that instead
+                if [ -n "$ISAAC_SIM_WHEEL_PATH" ]; then
+                    filepath="$ISAAC_SIM_WHEEL_PATH/$filename"
+                    if [ ! -f "$filepath" ]; then
+                        echo "ERROR: ISAAC_SIM_WHEEL_PATH is set to $ISAAC_SIM_WHEEL_PATH but $filename not found there"
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
+                    echo "Using local wheel from ISAAC_SIM_WHEEL_PATH: $filepath"
+                else
+                    if ! curl -sL "$url" -o "$filepath"; then
+                        echo "ERROR: Failed to download $pkg"
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
                 fi
-                
+
                 # Rename for older GLIBC
                 if check_glibc_old; then
                     local new_filepath="${filepath/manylinux_2_34/manylinux_2_31}"
