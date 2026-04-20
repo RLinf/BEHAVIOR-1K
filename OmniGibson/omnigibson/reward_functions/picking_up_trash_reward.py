@@ -2,15 +2,29 @@ from omnigibson.object_states.inside import Inside
 from omnigibson.reward_functions.sequential_task_reward import SequentialTaskReward
 from omnigibson.reward_functions.support_utils import (
     get_min_eef_distance_to_obj,
-    get_stage_objects,
+    get_stage_objects_by_name,
     is_supported_by_surface,
     is_target_in_hand,
-    load_orchestrator_stage_annotations,
 )
 
 
 class PickingUpTrashReward(SequentialTaskReward):
     """Task-bound sequential reward for `picking_up_trash`."""
+
+    STAGE_ANNOTATIONS = (
+        {"skill_description": "move to", "object_id": ("trash_can_116",)},
+        {"skill_description": "pick up from", "object_id": ("trash_can_116", "floors_zqjkvm_0")},
+        {"skill_description": "move to", "object_id": ("can_of_soda_114",)},
+        {"skill_description": "pick up from", "object_id": ("can_of_soda_114", "floors_ulujpr_0")},
+        {"skill_description": "place in", "object_id": ("can_of_soda_114", "trash_can_116")},
+        {"skill_description": "move to", "object_id": ("can_of_soda_115",)},
+        {"skill_description": "pick up from", "object_id": ("can_of_soda_115", "floors_ulujpr_0")},
+        {"skill_description": "place in", "object_id": ("can_of_soda_115", "trash_can_116")},
+        {"skill_description": "move to", "object_id": ("can_of_soda_113",)},
+        {"skill_description": "pick up from", "object_id": ("can_of_soda_113", "floors_ulujpr_0")},
+        {"skill_description": "place in", "object_id": ("can_of_soda_113", "trash_can_116")},
+        {"skill_description": "place on", "object_id": ("trash_can_116", "floors_ulujpr_0")},
+    )
 
     def __init__(
         self,
@@ -25,7 +39,6 @@ class PickingUpTrashReward(SequentialTaskReward):
         place_on_progress_scale=3.0,
         place_on_dense_scale=0.25,
         stage_completion_bonus=1.0,
-        orchestrators_annotation_dir=None,
     ):
         self.move_to_success_threshold = move_to_success_threshold
         self.move_to_progress_scale = move_to_progress_scale
@@ -37,17 +50,16 @@ class PickingUpTrashReward(SequentialTaskReward):
         self.place_in_success_reward = place_in_success_reward
         self.place_on_progress_scale = place_on_progress_scale
         self.place_on_dense_scale = place_on_dense_scale
-        self.orchestrators_annotation_dir = orchestrators_annotation_dir
 
         self._stage_specs = []
         super().__init__(stage_completion_bonus=stage_completion_bonus)
 
     def reset(self, task, env):
-        stage_annotations = load_orchestrator_stage_annotations(self.orchestrators_annotation_dir)
+        stage_annotations = self.STAGE_ANNOTATIONS
         self._stage_specs = []
 
         for stage_idx, stage_annotation in enumerate(stage_annotations):
-            stage_objects = get_stage_objects(env, stage_annotation)
+            stage_objects = get_stage_objects_by_name(env, stage_annotation.get("object_id", []))
             object_names = list(stage_annotation.get("object_id", []))
             skill = (stage_annotation.get("skill_description") or "").strip().lower()
 

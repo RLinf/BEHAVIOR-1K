@@ -1,7 +1,3 @@
-import os
-import json
-import re
-
 import torch as th
 
 from omnigibson.object_states.adjacency import VerticalAdjacency
@@ -12,27 +8,6 @@ from omnigibson.utils.ui_utils import create_module_logger
 
 log = create_module_logger(module_name=__name__)
 
-
-def load_orchestrator_stage_annotations(orchestrators_annotation_dir):
-    stage_annotations = []
-    def _subtask_sort_key(filename):
-        match = re.match(r"subtask_(\d+)_annotated\.json$", filename)
-        return int(match.group(1)) if match else float("inf")
-
-    for filename in sorted(os.listdir(orchestrators_annotation_dir), key=_subtask_sort_key):
-        if not (filename.startswith("subtask_") and filename.endswith("_annotated.json")):
-            continue
-        annotation_file = os.path.join(orchestrators_annotation_dir, filename)
-        try:
-            with open(annotation_file, "r") as f:
-                stage_annotations.append(json.load(f))
-        except (OSError, TypeError, ValueError) as exc:
-            log.warning(
-                "Stage annotation load for %s failed with %s. Skipping this stage annotation file.",
-                annotation_file,
-                type(exc).__name__,
-            )
-    return stage_annotations
 
 def find_object_by_name(env, object_name):
     for obj in getattr(getattr(env, "scene", None), "objects", []):
@@ -46,13 +21,8 @@ def find_object_by_name(env, object_name):
 
     return None
 
-def get_stage_objects(env, stage_annotation):
-    object_names = list(stage_annotation.get("object_id", []))
-    stage_objects = []
-    for object_name in object_names:
-        obj = find_object_by_name(env, object_name)
-        stage_objects.append(obj)
-    return stage_objects
+def get_stage_objects_by_name(env, object_names):
+    return [find_object_by_name(env, object_name) for object_name in object_names]
 
 def _warn_exception(context, exc, fallback_message):
     """
