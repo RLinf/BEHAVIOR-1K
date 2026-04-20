@@ -5,15 +5,25 @@ from omnigibson.reward_functions.sequential_task_reward import SequentialTaskRew
 from omnigibson.reward_functions.support_utils import (
     get_min_eef_distance_to_obj,
     get_min_eef_distance_to_toggle,
-    get_stage_objects,
+    get_stage_objects_by_name,
     is_supported_by_surface,
     is_target_in_hand,
-    load_orchestrator_stage_annotations,
 )
 
 
 class MakeMicrowavePopcornReward(SequentialTaskReward):
     """Task-bound sequential reward for `make_microwave_popcorn`."""
+
+    STAGE_OBJECT_NAMES = {
+        "move_to_microwave": ("microwave_hjjxmi_0",),
+        "open_microwave_door": ("microwave_hjjxmi_0",),
+        "move_to_popcorn": ("popcorn_bag_73",),
+        "pickup_popcorn_from_bar": ("popcorn_bag_73", "bar_byvbuc_0"),
+        "return_to_microwave": ("microwave_hjjxmi_0",),
+        "place_popcorn_in_microwave": ("popcorn_bag_73", "microwave_hjjxmi_0"),
+        "close_microwave_door": ("microwave_hjjxmi_0",),
+        "turn_on_microwave": ("microwave_hjjxmi_0",),
+    }
 
     def __init__(
         self,
@@ -36,7 +46,6 @@ class MakeMicrowavePopcornReward(SequentialTaskReward):
         toggle_progress_scale=0.5,
         toggle_progress_dense_scale=0.4,
         stage_completion_bonus=1.0,
-        orchestrators_annotation_dir=None,
     ):
         self.move_to_success_threshold = move_to_success_threshold
         self.move_to_progress_scale = move_to_progress_scale
@@ -56,7 +65,6 @@ class MakeMicrowavePopcornReward(SequentialTaskReward):
         self.press_dense_scale = press_dense_scale
         self.toggle_progress_scale = toggle_progress_scale
         self.toggle_progress_dense_scale = toggle_progress_dense_scale
-        self.orchestrators_annotation_dir = orchestrators_annotation_dir
 
         self._microwave_obj = None
         self._popcorn_obj = None
@@ -93,16 +101,9 @@ class MakeMicrowavePopcornReward(SequentialTaskReward):
         return all(sides_openness)
 
     def reset(self, task, env):
-        stage_annotations = load_orchestrator_stage_annotations(self.orchestrators_annotation_dir)
         self._stage_objects = {
-            "move_to_microwave": get_stage_objects(env, stage_annotations[0]),
-            "open_microwave_door": get_stage_objects(env, stage_annotations[1]),
-            "move_to_popcorn": get_stage_objects(env, stage_annotations[2]),
-            "pickup_popcorn_from_bar": get_stage_objects(env, stage_annotations[3]),
-            "return_to_microwave": get_stage_objects(env, stage_annotations[4]),
-            "place_popcorn_in_microwave": get_stage_objects(env, stage_annotations[5]),
-            "close_microwave_door": get_stage_objects(env, stage_annotations[6]),
-            "turn_on_microwave": get_stage_objects(env, stage_annotations[7]),
+            stage_name: get_stage_objects_by_name(env, object_names)
+            for stage_name, object_names in self.STAGE_OBJECT_NAMES.items()
         }
 
         self._microwave_obj = (

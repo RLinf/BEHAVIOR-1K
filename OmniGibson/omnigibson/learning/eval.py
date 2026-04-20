@@ -34,7 +34,6 @@ from omnigibson.learning.utils.eval_utils import (
     format_subtask_range_label,
     generate_basic_environment_config,
     flatten_obs_dict,
-    get_task_specific_reward,
     get_reward_stage_result,
     format_stage_progress_lines,
     get_instance_to_run,
@@ -144,7 +143,6 @@ class Evaluator:
         cfg["task"]["reward_config"]["reward_mode"] = self.cfg.instance_reward_mode
         if self.cfg.instance_reward_mode in {"task", "combined"}:
             task_reward_kwargs = OmegaConf.to_container(self.cfg.task_specific_reward_kwargs, resolve=True) or {}
-            task_reward_kwargs["orchestrators_annotation_dir"] = self.cfg.orchestrators_annotation_dir
             cfg["task"]["reward_config"]["task_specific_reward_name"] = task_name
             cfg["task"]["reward_config"]["task_specific_reward_kwargs"] = task_reward_kwargs
         logger.info(
@@ -458,14 +456,8 @@ class Evaluator:
         )
 
     def update_orchestrators_annotation_dir(self, orchestrators_annotation_dir: Path) -> None:
-        """
-        Update the active orchestrator annotation directory before any environment reset.
-        """
+        """Update the active orchestrator annotation directory for subtask bookkeeping."""
         self.cfg["orchestrators_annotation_dir"] = orchestrators_annotation_dir
-        task_reward = get_task_specific_reward(self)
-        if hasattr(task_reward, "orchestrators_annotation_dir"):
-            # Keep the reward function pointed at the current episode annotations.
-            task_reward.orchestrators_annotation_dir = orchestrators_annotation_dir
 
     def replay_demo_to_preparatory_state(
         self,

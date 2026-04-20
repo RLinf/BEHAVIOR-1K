@@ -6,15 +6,39 @@ from omnigibson.reward_functions.sequential_task_reward import SequentialTaskRew
 from omnigibson.reward_functions.support_utils import (
     get_min_eef_distance_to_obj,
     get_obj_center,
-    get_stage_objects,
+    get_stage_objects_by_name,
     is_supported_by_surface,
     is_target_in_hand,
-    load_orchestrator_stage_annotations,
 )
 
 
 class SetUpACoffeeStationInYourKitchenReward(SequentialTaskReward):
     """Task-bound sequential reward for `set_up_a_coffee_station_in_your_kitchen`."""
+
+    STAGE_ANNOTATIONS = (
+        {"skill_description": "move to", "object_id": ("coffee_cup_209",)},
+        {"skill_description": "pick up from", "object_id": ("coffee_cup_209", "countertop_kelzer_0")},
+        {"skill_description": "move to", "object_id": ("saucer_208",)},
+        {"skill_description": "place on", "object_id": ("coffee_cup_209", "saucer_208")},
+        {"skill_description": "move to", "object_id": ("electric_kettle_207",)},
+        {"skill_description": "pick up from", "object_id": ("electric_kettle_207", "countertop_kelzer_0")},
+        {"skill_description": "move to", "object_id": ("coffee_maker_212",)},
+        {
+            "skill_description": "place on next to",
+            "object_id": ("electric_kettle_207", "countertop_kelzer_0", "coffee_maker_212"),
+        },
+        {"skill_description": "move to", "object_id": ("paper_coffee_filter_210",)},
+        {"skill_description": "pick up from", "object_id": ("paper_coffee_filter_210", "countertop_kelzer_0")},
+        {"skill_description": "move to", "object_id": ("coffee_maker_212",)},
+        {"skill_description": "place in", "object_id": ("paper_coffee_filter_210", "coffee_maker_212")},
+        {"skill_description": "move to", "object_id": ("bottle_of_coffee_211",)},
+        {"skill_description": "pick up from", "object_id": ("bottle_of_coffee_211", "shelf_pfusrd_1")},
+        {"skill_description": "move to", "object_id": ("coffee_maker_212",)},
+        {
+            "skill_description": "place on next to",
+            "object_id": ("bottle_of_coffee_211", "countertop_kelzer_0", "coffee_maker_212"),
+        },
+    )
 
     def __init__(
         self,
@@ -31,7 +55,6 @@ class SetUpACoffeeStationInYourKitchenReward(SequentialTaskReward):
         next_to_progress_scale=2.5,
         next_to_dense_scale=0.2,
         stage_completion_bonus=1.0,
-        orchestrators_annotation_dir=None,
     ):
         self.move_to_success_threshold = move_to_success_threshold
         self.move_to_progress_scale = move_to_progress_scale
@@ -45,17 +68,16 @@ class SetUpACoffeeStationInYourKitchenReward(SequentialTaskReward):
         self.place_in_success_reward = place_in_success_reward
         self.next_to_progress_scale = next_to_progress_scale
         self.next_to_dense_scale = next_to_dense_scale
-        self.orchestrators_annotation_dir = orchestrators_annotation_dir
 
         self._stage_specs = []
         super().__init__(stage_completion_bonus=stage_completion_bonus)
 
     def reset(self, task, env):
-        stage_annotations = load_orchestrator_stage_annotations(self.orchestrators_annotation_dir)
+        stage_annotations = self.STAGE_ANNOTATIONS
         self._stage_specs = []
 
         for stage_idx, stage_annotation in enumerate(stage_annotations):
-            stage_objects = get_stage_objects(env, stage_annotation)
+            stage_objects = get_stage_objects_by_name(env, stage_annotation.get("object_id", []))
             object_names = list(stage_annotation.get("object_id", []))
             skill = (stage_annotation.get("skill_description") or "").strip().lower()
 
