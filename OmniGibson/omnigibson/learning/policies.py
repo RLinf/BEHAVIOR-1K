@@ -42,6 +42,7 @@ class LocalPolicy:
 class WebsocketPolicy:
     """
     Websocket policy for controlling the robot over a websocket connection.
+    Supports runtime host/port switching for multi-model orchestration.
     """
 
     def __init__(
@@ -49,24 +50,49 @@ class WebsocketPolicy:
         *args,
         host: Optional[str] = None,
         port: Optional[int] = None,
+        allow_reconnect: bool = False,
         **kwargs,
     ) -> None:
+        self._host = host
+        self._port = port
         logging.info(f"Creating websocket client policy with host: {host}, port: {port}")
         self.last_action = None
         self.policy = None
+        self._allow_reconnect = allow_reconnect
         if host is not None or port is not None:
-            self.policy = WebsocketClientPolicy(host=host, port=port)
+            self.policy = WebsocketClientPolicy(host=host, port=port, allow_reconnect=allow_reconnect)
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self._host}:{self._port}"
 
     def update_host(self, host: str, port: int) -> None:
-        self.policy = WebsocketClientPolicy(host=host, port=port)
+        old_endpoint = self.endpoint
+        if hasattr(self.policy, "_ws") and self.policy._ws is not None:
+            try:
+                self.policy._ws.close()
+            except Exception:
+                pass
+        self._host = host
+        self._port = port
+        self.policy = WebsocketClientPolicy(host=host, port=port, allow_reconnect=self._allow_reconnect)
+        logging.info(f"WebsocketPolicy reconnected: {old_endpoint} -> {self.endpoint}")
 
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
-        if "need_new_action" in obs and not obs["need_new_action"] and self.last_action is not None:
-            return self.last_action
-        # convert observation to numpy
-        obs = torch_to_numpy(obs)
+        obs = torch_to_numpy(obs) if obs is not None else None
         self.last_action = self.policy.act(obs).detach().cpu()
         return self.last_action
+
+    @property
+    def is_done(self) -> bool:
+        return bool(self.policy is not None and getattr(self.policy, "is_done", False))
+
+    @property
+    def needs_obs(self) -> bool:
+        """
+        Whether the websocket policy needs a fresh observation for the next action request.
+        """
+        return bool(self.policy is None or getattr(self.policy, "needs_obs", True))
 
     def reset(self) -> None:
         if self.policy is not None:

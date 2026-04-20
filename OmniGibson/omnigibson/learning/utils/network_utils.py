@@ -11,13 +11,16 @@ import numpy as np
 import time
 import torch as th
 import traceback
-import websockets.asyncio.server as _server
-import websockets.sync.client
 import websockets
 import requests
 from copy import deepcopy
 from omnigibson.macros import gm
 from typing import Any, Dict, Optional, Tuple
+
+try:
+    import websockets.sync.client as _ws_sync_client
+except Exception:
+    _ws_sync_client = None
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -46,11 +49,24 @@ class WebsocketClientPolicy:
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
+        self._last_done = False
+        self._needs_fresh_obs = True
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
 
-    def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
+    @property
+    def is_done(self) -> bool:
+        return self._last_done
+
+    @property
+    def needs_obs(self) -> bool:
+        """
+        Whether the next action request needs a fresh observation payload.
+        """
+        return self._needs_fresh_obs
+
+    def _wait_for_server(self) -> Tuple[Any, Dict]:
         # TODO [Wensi]: use URL parser instead of this
         # Extract host and port for health check
         host_port = self._uri.replace("ws://", "").replace("wss://", "")
@@ -75,15 +91,28 @@ class WebsocketClientPolicy:
         # Now attempt websocket connection (rest of the code remains the same)
         while True:
             try:
+                assert _ws_sync_client is not None, "websockets.sync.client is unavailable in this environment"
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
-                conn = websockets.sync.client.connect(
-                    self._uri,
+                connect_kwargs = dict(
                     compression=None,
                     max_size=None,
                     additional_headers=headers,
                     ping_interval=60,
                     ping_timeout=300,
                 )
+                try:
+                    conn = _ws_sync_client.connect(
+                        self._uri,
+                        **connect_kwargs,
+                    )
+                except TypeError:
+                    # Some websocket client variants do not accept ping kwargs.
+                    connect_kwargs.pop("ping_interval", None)
+                    connect_kwargs.pop("ping_timeout", None)
+                    conn = _ws_sync_client.connect(
+                        self._uri,
+                        **connect_kwargs,
+                    )
                 metadata = unpackb(conn.recv())
                 logger.info("Connected to server!")
                 return conn, metadata
@@ -91,11 +120,12 @@ class WebsocketClientPolicy:
                 logger.info(f"Websocket connection failed ({e}), retrying...")
                 time.sleep(5)
 
-    def act(self, obs: Dict) -> th.Tensor:
+    def act(self, obs: Optional[Dict]) -> th.Tensor:
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
-        data = self._packer.pack(obs)
+        request_payload = obs if self._needs_fresh_obs else {"reuse_cached_action": True}
+        data = self._packer.pack(request_payload)
         while True:
             try:
                 self._ws.send(data)
@@ -111,6 +141,8 @@ class WebsocketClientPolicy:
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
         action_dict = unpackb(response)
+        self._last_done = bool(action_dict.get("done", False))
+        self._needs_fresh_obs = bool(action_dict.get("need_obs", True))
         try:
             action_np = deepcopy(action_dict["action"])
         except KeyError:
@@ -119,6 +151,8 @@ class WebsocketClientPolicy:
             self._ws.send(data)
             response = self._ws.recv()
             action_dict = unpackb(response)
+            self._last_done = bool(action_dict.get("done", False))
+            self._needs_fresh_obs = bool(action_dict.get("need_obs", True))
             action_np = deepcopy(action_dict["action"])
         action = th.from_numpy(action_np).to(th.float32)
         return action
@@ -129,6 +163,8 @@ class WebsocketClientPolicy:
 
         data = self._packer.pack({"reset": True})
         self._ws.send(data)
+        self._last_done = False
+        self._needs_fresh_obs = True
 
 
 class WebsocketPolicyServer:
@@ -154,7 +190,12 @@ class WebsocketPolicyServer:
 
     async def run(self):
         logger.info(f"Starting websocket server on {self._host}:{self._port}...")
-        async with _server.serve(
+        try:
+            import websockets.asyncio.server as ws_async_server
+        except Exception:
+            import websockets.legacy.server as ws_async_server
+
+        async with ws_async_server.serve(
             self._handler,
             self._host,
             self._port,
@@ -179,14 +220,21 @@ class WebsocketPolicyServer:
                     self._policy.reset()
                     continue
 
-                obs = deepcopy(result)
+                reuse_cached_action = bool(result.get("reuse_cached_action", False))
+                obs = None if reuse_cached_action else deepcopy(result)
 
                 infer_time = time.monotonic()
                 action = self._policy.act(obs)
                 infer_time = time.monotonic() - infer_time
 
+                need_obs = True
+                if hasattr(self._policy, "needs_observation"):
+                    next_need_obs = getattr(self._policy, "needs_observation")
+                    need_obs = bool(next_need_obs() if callable(next_need_obs) else next_need_obs)
+
                 action = {
                     "action": action.cpu().numpy(),
+                    "need_obs": need_obs,
                 }
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,

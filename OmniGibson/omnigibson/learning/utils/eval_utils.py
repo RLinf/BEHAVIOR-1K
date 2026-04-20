@@ -1,6 +1,13 @@
+from copy import deepcopy
+import os
+import json
+import csv
+import re
+from typing import Dict, List
 import numpy as np
 import torch as th
 from collections import OrderedDict
+from pathlib import Path
 
 
 ROBOT_CAMERA_NAMES = {
@@ -242,6 +249,345 @@ TASK_NAMES_TO_INDICES = {
 TASK_INDICES_TO_NAMES = {v: k for k, v in TASK_NAMES_TO_INDICES.items()}
 
 
+def load_subtask_frame(orchestrators_annotation_dir, subtask_index, is_start_frame=True):
+    annotation_path = os.path.join(orchestrators_annotation_dir, f"subtask_{int(subtask_index)}_annotated.json")
+    with open(annotation_path, "r") as f:
+        subtask_info = json.load(f)
+    frame = subtask_info.get("start_frame") if is_start_frame else subtask_info.get("end_frame")
+
+    assert isinstance(frame, int), (
+        f"Subtask annotation {annotation_path} is missing an integer frame: {frame}"
+    )
+    return frame
+
+
+def load_subtask_annotations(orchestrators_annotation_dir) -> List[tuple[int, Dict]]:
+    """
+    Load all subtask annotation files for one episode in index order.
+    """
+    annotation_dir = Path(orchestrators_annotation_dir)
+    annotations = []
+    for annotation_path in sorted(
+        annotation_dir.glob("subtask_*_annotated.json"),
+        key=lambda path: int(path.stem.split("_")[1]),
+    ):
+        subtask_index = int(annotation_path.stem.split("_")[1])
+        with open(annotation_path, "r") as f:
+            annotations.append((subtask_index, json.load(f)))
+    return annotations
+
+
+def normalize_skill_text(skill_text: str) -> str:
+    """
+    Normalize free-form skill text into a stable snake_case token for matching.
+    """
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(skill_text or "").strip().lower())
+    return normalized.strip("_")
+
+
+def canonicalize_skill_label(skill_text: str) -> str:
+    """
+    Collapse different user / annotation spellings into one canonical skill key.
+    """
+    normalized = normalize_skill_text(skill_text)
+    collapsed = normalized.replace("_", "")
+
+    if collapsed.startswith("moveto"):
+        return "move_to"
+    if collapsed.startswith("pick") and "from" in collapsed:
+        return "pickup_from"
+    if collapsed.startswith("press"):
+        return "press"
+    if collapsed.startswith("place") and "nextto" in collapsed and "on" in collapsed:
+        return "place_on_next_to"
+    if collapsed.startswith("place") and "on" in collapsed:
+        return "place_on"
+    if collapsed.startswith("place") and "in" in collapsed:
+        return "place_in"
+
+    return normalized
+
+
+def subtask_matches_skill(subtask_info: Dict, target_skill: str) -> bool:
+    """
+    Match one subtask annotation against a user-facing skill selector.
+    """
+    target_normalized = normalize_skill_text(target_skill)
+    target_canonical = canonicalize_skill_label(target_skill)
+
+    candidate_texts = [
+        subtask_info.get("skill_description", ""),
+        subtask_info.get("cot_subtask_description", ""),
+    ]
+    candidate_tokens = {
+        normalize_skill_text(text)
+        for text in candidate_texts
+        if isinstance(text, str) and len(text.strip()) > 0
+    }
+    candidate_tokens.update(
+        canonicalize_skill_label(text)
+        for text in candidate_texts
+        if isinstance(text, str) and len(text.strip()) > 0
+    )
+    return target_normalized in candidate_tokens or target_canonical in candidate_tokens
+
+
+def build_subtask_eval_targets(
+    orchestrators_annotation_dir,
+    *,
+    subtask_skill=None,
+    subtask_index=None,
+    subtask_end_index=None,
+) -> List[Dict]:
+    """
+    Resolve subtask evaluation targets from either a skill filter or an explicit index range.
+    """
+    annotations = load_subtask_annotations(orchestrators_annotation_dir)
+    assert len(annotations) > 0, f"No subtask annotations found under {orchestrators_annotation_dir}"
+
+    annotation_map = {subtask_idx: subtask_info for subtask_idx, subtask_info in annotations}
+
+    if subtask_skill is not None:
+        matches = [
+            (subtask_idx, subtask_info)
+            for subtask_idx, subtask_info in annotations
+            if subtask_matches_skill(subtask_info, subtask_skill)
+        ]
+        assert len(matches) > 0, (
+            f"No subtasks matched skill '{subtask_skill}' under {orchestrators_annotation_dir}"
+        )
+        return [
+            {
+                "subtask_start_idx": subtask_idx,
+                "subtask_end_idx": subtask_idx,
+                "selected_subtask_infos": [(subtask_idx, subtask_info)],
+                "selection_mode": "skill",
+                "selection_value": subtask_skill,
+            }
+            for subtask_idx, subtask_info in matches
+        ]
+
+    if subtask_index is not None:
+        resolved_start_idx = int(subtask_index)
+        resolved_end_idx = resolved_start_idx if subtask_end_index is None else int(subtask_end_index)
+        assert resolved_start_idx <= resolved_end_idx, (
+            f"Expected subtask_index <= subtask_end_index, got {resolved_start_idx} > {resolved_end_idx}"
+        )
+        selected_subtask_infos = []
+        for idx in range(resolved_start_idx, resolved_end_idx + 1):
+            assert idx in annotation_map, (
+                f"Missing subtask_{idx}_annotated.json under {orchestrators_annotation_dir}"
+            )
+            selected_subtask_infos.append((idx, annotation_map[idx]))
+        return [
+            {
+                "subtask_start_idx": resolved_start_idx,
+                "subtask_end_idx": resolved_end_idx,
+                "selected_subtask_infos": selected_subtask_infos,
+                "selection_mode": "index",
+                "selection_value": format_subtask_range_label(resolved_start_idx, resolved_end_idx),
+            }
+        ]
+
+    # When no selector is provided, evaluate every annotated subtask individually.
+    return [
+        {
+            "subtask_start_idx": subtask_idx,
+            "subtask_end_idx": subtask_idx,
+            "selected_subtask_infos": [(subtask_idx, subtask_info)],
+            "selection_mode": "all",
+            "selection_value": "all",
+        }
+        for subtask_idx, subtask_info in annotations
+    ]
+
+
+def resolve_episode_indices(
+    demo_data_dir,
+    task_index: int,
+    *,
+    run_episode_idx=None,
+    run_episode_indices=None,
+) -> List[int]:
+    """
+    Resolve which demo episodes to evaluate for one task.
+    """
+    selected = run_episode_indices if run_episode_indices is not None else run_episode_idx
+    if selected is not None:
+        if not isinstance(selected, (str, bytes)) and hasattr(selected, "__iter__"):
+            return [int(episode_index) for episode_index in selected]
+        return [int(selected)]
+
+    episode_root = Path(demo_data_dir) / "orchestrators" / f"task-{task_index:04d}"
+    episode_dirs = sorted(
+        episode_root.glob("episode_*"),
+        key=lambda path: int(path.name.split("_")[1]),
+    )
+    return [int(path.name.split("_")[1]) for path in episode_dirs]
+
+
+def extract_sequential_reward_info(info: Dict) -> Dict:
+    if not isinstance(info, dict):
+        return {}
+
+    if "stage_infos" in info or "current_stage_name" in info:
+        return info
+
+    reward_info = info.get("reward")
+    if isinstance(reward_info, dict):
+        task_specific = reward_info.get("task_specific")
+        if isinstance(task_specific, dict):
+            return task_specific
+
+        for reward_payload in reward_info.values():
+            if isinstance(reward_payload, dict) and (
+                "stage_infos" in reward_payload or "current_stage_name" in reward_payload
+            ):
+                return reward_payload
+
+    return {}
+
+
+def delay_termination_until_stage_completion(info: Dict) -> Dict:
+    info = deepcopy(info) if isinstance(info, dict) else {}
+    sequential_info = extract_sequential_reward_info(info)
+    done_info = info.get("done")
+    if not isinstance(done_info, dict) or not sequential_info:
+        return info
+
+    if done_info.get("success"):
+        if not sequential_info.get("all_stages_completed", False):
+            done_info["success"] = False
+            done_info["waiting_for_stage_completion"] = True
+        else:
+            done_info["keep_running_after_success"] = True
+
+    return info
+
+
+def get_task_specific_reward(evaluator):
+    reward_functions = getattr(evaluator.env.task, "_reward_functions", {})
+    task_reward = reward_functions.get("task_specific") if isinstance(reward_functions, dict) else None
+    assert task_reward is not None, (
+        "Subtask reward-stage evaluation requires a task_specific reward. "
+        "Set instance_reward_mode=task or combined and provide a task-specific reward implementation."
+    )
+    return task_reward
+
+
+def get_reward_stage_result(info: Dict, target_stage_idx: int):
+    reward_info = info['reward']
+    stage_infos = reward_info['task_specific']['stage_infos']
+    stage_name = list(stage_infos.keys())[target_stage_idx]
+    stage_info = stage_infos[stage_name]
+    stage_completed = bool(stage_info['completed'])
+    return stage_completed, stage_info, reward_info
+
+
+def prime_task_reward_for_subtask(evaluator, subtask_idx: int) -> None:
+    task_reward = get_task_specific_reward(evaluator)
+    if hasattr(task_reward, "set_active_stage_index"):
+        # When we jump into subtask i from demo state, earlier reward stages
+        # should already count as finished so logs and completion checks align.
+        task_reward.set_active_stage_index(subtask_idx)
+
+
+def format_subtask_range_label(start_idx: int, end_idx: int) -> str:
+    return f"{start_idx}" if start_idx == end_idx else f"{start_idx}->{end_idx}"
+
+
+def _format_scalar(value) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+_VIDEO_ACTIVE_METRIC_KEYS = {
+    "move_to_radio": ["eef_to_obj_distance", "success_threshold"],
+    "pickup_from_support": ["eef_to_obj_distance"],
+    "press_radio": ["eef_to_toggle_distance", "toggle_steps"],
+    "place_on_support": ["eef_to_obj_distance"],
+}
+
+
+def format_stage_status_chain(info: Dict):
+    info = extract_sequential_reward_info(info)
+    stage_infos = info.get("stage_infos")
+    current_stage_name = info.get("current_stage_name")
+    all_stages_completed = bool(info.get("all_stages_completed", False))
+    if not isinstance(stage_infos, dict) or len(stage_infos) == 0:
+        return None
+
+    parts = []
+    for stage_name, stage_info in stage_infos.items():
+        if all_stages_completed or bool(stage_info.get("completed", False)):
+            status = "done"
+        elif stage_name == current_stage_name:
+            status = "doing"
+        else:
+            status = "todo"
+        parts.append(f"{stage_name} ({status})")
+
+    return " > ".join(parts)
+
+
+def format_stage_progress_lines(info: Dict, *, concise: bool=False) -> List[str]:
+    reward_info = extract_sequential_reward_info(info or {})
+    lines = []
+    stage_chain = format_stage_status_chain(reward_info)
+    if stage_chain is not None:
+        lines.append(f"stages: {stage_chain}")
+
+    stage_total_rewards = reward_info.get("stage_cumulative_rewards")
+    stage_rewards = reward_info.get("stage_rewards")
+    if isinstance(stage_total_rewards, dict) and len(stage_total_rewards) > 0:
+        lines.append(
+            "stage_total_rewards: "
+            + ", ".join(
+                f"{stage_name}={stage_reward:.3f}" for stage_name, stage_reward in stage_total_rewards.items()
+            )
+        )
+    elif isinstance(stage_rewards, dict) and len(stage_rewards) > 0:
+        lines.append(
+            "stage_rewards: "
+            + ", ".join(f"{stage_name}={stage_reward:.3f}" for stage_name, stage_reward in stage_rewards.items())
+        )
+
+    current_stage_name = reward_info.get("current_stage_name")
+    stage_infos = reward_info.get("stage_infos")
+    active_stage_info = stage_infos.get(current_stage_name, {}) if isinstance(stage_infos, dict) else {}
+    if isinstance(current_stage_name, str) and isinstance(active_stage_info, dict):
+        stage_reward = active_stage_info.get("reward")
+        if not isinstance(stage_reward, (int, float)) or isinstance(stage_reward, bool):
+            stage_reward = stage_rewards.get(current_stage_name) if isinstance(stage_rewards, dict) else None
+        if isinstance(stage_reward, (int, float)) and not isinstance(stage_reward, bool):
+            lines.append(f"reward: {_format_scalar(stage_reward)}")
+
+        completed = active_stage_info.get("completed")
+        if isinstance(completed, bool):
+            lines.append(f"completed: {completed}")
+
+        metric_keys = set(_VIDEO_ACTIVE_METRIC_KEYS.get(current_stage_name, [])) if concise else None
+        metrics = [
+            f"{key}={_format_scalar(value)}"
+            for key, value in active_stage_info.items()
+            if key not in {"reward", "completed"}
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and (metric_keys is None or key in metric_keys)
+        ]
+        if metrics:
+            lines.append("metrics: " + ", ".join(metrics))
+
+    return lines
+
+
+def format_video_info_lines(info: Dict, step: int, reward: float) -> List[str]:
+    return [f"step={step} reward={reward:.4f}", *format_stage_progress_lines(info, concise=True)]
+
+
 def generate_basic_environment_config(task_name, task_cfg):
     """
     Generate a basic environment configuration
@@ -280,6 +626,9 @@ def generate_basic_environment_config(task_name, task_cfg):
             },
             "reward_config": {
                 "r_potential": 1.0,
+                "reward_mode": "potential",
+                "task_specific_reward_name": None,
+                "task_specific_reward_kwargs": {},
             },
             "include_obs": False,
         },
@@ -311,3 +660,48 @@ def find_start_point(base_vel):
     if len(start_idx) == 0:
         return 0
     return min(start_idx[0], 500)  # Limit to the first 100 points to avoid long initial periods
+
+
+def get_instance_to_run(config, m, gm, logger):
+    # get run instances
+    if config.eval_on_train_instances:
+        logger.info(
+            "You are evaluating on training instances, set eval_on_train_instances to False for test instances."
+        )
+        task_idx = TASK_NAMES_TO_INDICES[config.task.name]
+        with open(os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl"), "r") as f:
+            episodes = [json.loads(line) for line in f]
+        instances_to_run = []
+        for episode in episodes:
+            if episode["episode_index"] // 1e4 == task_idx:
+                instances_to_run.append(str(int((episode["episode_index"] // 10) % 1e3)))
+        if config.eval_instance_ids:
+            assert set(config.eval_instance_ids).issubset(
+                set(range(m.NUM_TRAIN_INSTANCES))
+            ), f"eval instance ids must be in range({m.NUM_TRAIN_INSTANCES})"
+            instances_to_run = [instances_to_run[i] for i in config.eval_instance_ids]
+    elif config.test_hidden:
+        instances_to_run = (
+            config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
+        )
+        assert set(instances_to_run).issubset(
+            set(range(m.NUM_EVAL_INSTANCES))
+        ), f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+    else:
+        instances_to_run = (
+            config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
+        )
+        assert set(instances_to_run).issubset(
+            set(range(m.NUM_EVAL_INSTANCES))
+        ), f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+        task_instance_csv_path = os.path.join(
+            gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "test_instances.csv"
+        )
+        with open(task_instance_csv_path, "r") as f:
+            lines = list(csv.reader(f))[1:]
+        assert (
+            lines[TASK_NAMES_TO_INDICES[config.task.name]][1] == config.task.name
+        ), f"Task name from config {config.task.name} does not match task name from csv {lines[TASK_NAMES_TO_INDICES[config.task.name]][1]}"
+        test_instances = lines[TASK_NAMES_TO_INDICES[config.task.name]][2].strip().split(",")
+        instances_to_run = [int(test_instances[i]) for i in instances_to_run]
+    return instances_to_run
