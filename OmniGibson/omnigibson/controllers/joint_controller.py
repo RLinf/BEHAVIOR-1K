@@ -318,7 +318,7 @@ def _compute_joint_torques_torch(
 
 
 # Use numba since faster
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def numba_ix(arr, rows, cols):
     """
     Numba compatible implementation of arr[np.ix_(rows, cols)] for 2D arrays.
@@ -341,7 +341,7 @@ def numba_ix(arr, rows, cols):
     return slice_1d.reshape((len(rows), len(cols)))
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def _compute_joint_torques_numpy(
     u,
     mm,

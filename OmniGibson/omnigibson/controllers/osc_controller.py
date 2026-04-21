@@ -582,7 +582,7 @@ def _compute_osc_torques_torch(
 
 
 # Use numba since faster
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def _compute_osc_torques_numpy(
     q,
     qd,

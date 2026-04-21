@@ -8,3 +8,5 @@ outputs/
 /*.ipynb
 bddl3/build
 OmniGibson/appdata
+
+__pycache__/

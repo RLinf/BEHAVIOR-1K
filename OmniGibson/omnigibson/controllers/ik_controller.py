@@ -418,7 +418,7 @@ def _compute_ik_qpos_torch(
 
 
 # Use numba since faster
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def _compute_ik_qpos_numpy(
     q,
     j_eef,
