@@ -1125,8 +1125,10 @@ class ManipulationRobot(BaseRobot):
         # If we're not using physical grasping, we check for gripper contact
         if self.grasping_mode != "physical":
             candidates_set, robot_contact_links = self._find_gripper_contacts(arm=arm)
-            # If we're using assisted grasping, we further filter candidates via ray-casting
-            if self.grasping_mode == "assisted":
+            # If we're using assisted grasping, we further filter candidates via ray-casting.
+            # Skip the (expensive) raycast pass when there are no contact candidates, since the
+            # intersection with the raycast result would be empty regardless.
+            if self.grasping_mode == "assisted" and candidates_set:
                 candidates_set_raycast = self._find_gripper_raycast_collisions(arm=arm)
                 candidates_set = candidates_set.intersection(candidates_set_raycast)
         else:
