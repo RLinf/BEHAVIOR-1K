@@ -1108,11 +1108,13 @@ def _launch_simulator(*args, **kwargs):
                                     # is playing
                                     obj.states[state_type].update()
 
-                    for scene in self.scenes:
-                        for obj in scene.objects:
-                            # Only update visuals for objects that have been initialized so far
-                            if isinstance(obj, StatefulObject) and obj.initialized:
-                                obj.update_visuals()
+                    # Skip visual updates when rendering is disabled (pure-physics steps).
+                    if self._render_on_step:
+                        for scene in self.scenes:
+                            for obj in scene.objects:
+                                # Only update visuals for objects that have been initialized so far
+                                if isinstance(obj, StatefulObject) and obj.initialized:
+                                    obj.update_visuals()
 
                 # Possibly run transition rule step
                 if gm.ENABLE_TRANSITION_RULES:
