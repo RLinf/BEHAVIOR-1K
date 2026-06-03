@@ -1265,6 +1265,52 @@ class MacroPhysicalParticleSystem(MacroParticleSystem, PhysicalParticleSystem):
                 pattern=f"{self.prim_path}/particles/*"
             )
 
+    def _get_particles_view_prim_paths(self):
+        view_prim_paths = getattr(self.particles_view, "prim_paths", None)
+        return [str(path) for path in view_prim_paths] if view_prim_paths is not None else None
+
+    def _prune_particles_missing_from_view(self, state, view_count):
+        if view_count <= 0 or view_count >= self.n_particles:
+            return state
+
+        view_prim_paths = self._get_particles_view_prim_paths()
+        if view_prim_paths is None:
+            particle_names = list(self.particles.keys()) if self.particles else []
+            missing_names = particle_names[view_count:]
+        else:
+            view_prim_path_set = set(view_prim_paths)
+            missing_names = [
+                name
+                for name, particle in self.particles.items()
+                if particle.prim_path not in view_prim_path_set
+            ]
+
+        if not missing_names:
+            return state
+
+        missing_idns = th.tensor(
+            sorted(self.particle_name2idn(name=name) for name in missing_names),
+            dtype=th.long,
+        )
+        log.warning(
+            "Pruning %s %s particle(s) missing from PhysX view during state load: %s",
+            len(missing_names),
+            self.name,
+            missing_names,
+        )
+
+        for name in missing_names:
+            super().remove_particle_by_name(name=name)
+
+        pruned_state = dict(state)
+        original_n_particles = state["n_particles"]
+        for key in ("positions", "orientations", "scales", "lin_velocities", "ang_velocities"):
+            value = state.get(key, None)
+            if value is not None and len(value) == original_n_particles:
+                pruned_state[key] = torch_delete(value, missing_idns, dim=0)
+        pruned_state["n_particles"] = self.n_particles
+        return pruned_state
+
     def _clear(self):
         # Run super method first
         super()._clear()
@@ -1502,6 +1548,10 @@ class MacroPhysicalParticleSystem(MacroParticleSystem, PhysicalParticleSystem):
     def _load_state(self, state):
         # Sync the number of particles first
         self._sync_particles(n_particles=state["n_particles"])
+
+        if self.initialized:
+            view_count = int(getattr(self.particles_view, "count", 0) or 0)
+            state = self._prune_particles_missing_from_view(state=state, view_count=view_count)
 
         super()._load_state(state=state)
 
