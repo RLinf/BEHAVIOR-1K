@@ -1,3 +1,5 @@
+import torch as th
+
 import omnigibson.utils.transform_utils as T
 from omnigibson.termination_conditions.termination_condition_base import SuccessCondition
 
@@ -24,7 +26,7 @@ class PointGoal(SuccessCondition):
         # Run super init
         super().__init__()
 
-    def _step(self, task, env, action):
+    def _step(self, task, env, action, env_indices=None):
         # Make sure task is of type PointNavigation -- we import at runtime to avoid circular imports
         from omnigibson.tasks.point_navigation_task import PointNavigationTask
 
@@ -32,7 +34,11 @@ class PointGoal(SuccessCondition):
             task, PointNavigationTask
         ), f"Cannot use {self.__class__.__name__} with a non-PointNavigationTask task instance!"
         # Terminate if point goal is reached (distance below threshold)
-        return (
-            T.l2_distance(task.get_current_pos(env)[self._distance_axes], task.get_goal_pos()[self._distance_axes])
-            < self._distance_tol
-        )
+        indices = range(env.num_envs) if env_indices is None else env_indices
+        results = th.zeros(len(indices), dtype=th.bool)
+        for row, env_idx in enumerate(indices):
+            current = task.get_current_pos(env, env_idx)
+            goal = task.get_goal_pos(env_idx)
+            dist = T.l2_distance(current[self._distance_axes], goal[self._distance_axes])
+            results[row] = dist < self._distance_tol
+        return results

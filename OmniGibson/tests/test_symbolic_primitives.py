@@ -37,7 +37,6 @@ def start_env(robot_type):
         raise ValueError("Invalid robot configuration")
     robots = load_robot_config(robot_type)
     config = {
-        "env": {"initial_pos_z_offset": 0.1},
         "render": {"viewer_width": 1280, "viewer_height": 720},
         "scene": {
             "type": "InteractiveTraversableScene",
@@ -116,12 +115,12 @@ def env(shared_env):
 
 @pytest.fixture
 def robot(env):
-    return env.robots[0]
+    return env.scene.robots[0]
 
 
 @pytest.fixture
 def prim_gen(env):
-    return SymbolicSemanticActionPrimitives(env, env.robots[0])
+    return SymbolicSemanticActionPrimitives(env, env.scene.robots[0])
 
 
 @pytest.fixture

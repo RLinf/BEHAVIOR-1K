@@ -10,8 +10,6 @@
 
     Macros enforce global behavior that is consistent within an individual python process but can differ between processes. This is useful because globally enabling all of **`OmniGibson`**'s features can cause unnecessary slowdowns, and so configuring the macros for your specific use case can optimize performance.
 
-    For example, Omniverse provides a so-called `flatcache` feature which provides significant performance boosts, but cannot be used when fluids or soft bodies are present. So, we ideally should always have `gm.USE_FLATCACHE=True` unless we have fluids or soft bodies in our environment.
-
 `macros` define a globally available set of magic numbers or flags set throughout **`OmniGibson`**. These can either be directly set in `omnigibson.macros.py`, or can be programmatically modified at runtime via:
 
 ```{.python .annotate}
@@ -379,7 +377,7 @@ python -m omnigibson.examples.object_states.dicing_demo
     --8<-- "examples/object_states/dicing_demo.py"
     ```
 
-### **Folded and Unfolded Demo**
+### **Folded and Unfolded Demo** [WIP]
 
 <div class="grid cards" markdown>
 
@@ -396,13 +394,13 @@ python -m omnigibson.examples.object_states.dicing_demo
 </div>
 
 ```{.python .annotate}
-python -m omnigibson.examples.object_states.folded_unfolded_state_demo
+python -m omnigibson.examples.wip.folded_unfolded_state_demo
 ```
 
 ??? code "folded_unfolded_state_demo.py"
 
     ``` py linenums="1"
-    --8<-- "examples/object_states/folded_unfolded_state_demo.py"
+    --8<-- "examples/wip/folded_unfolded_state_demo.py"
     ```
 
 ### **Overlaid Demo**
@@ -430,7 +428,7 @@ python -m omnigibson.examples.object_states.overlaid_demo
     --8<-- "examples/object_states/overlaid_demo.py"
     ```
 
-### **Heat Source or Sink Demo**
+### **Heat Source or Sink Demo** [WIP]
 
 <div class="grid cards" markdown>
 
@@ -446,13 +444,13 @@ python -m omnigibson.examples.object_states.overlaid_demo
 </div>
 
 ```{.python .annotate}
-python -m omnigibson.examples.object_states.heat_source_or_sink_demo
+python -m omnigibson.examples.wip.heat_source_or_sink_demo
 ```
 
 ??? code "heat_source_or_sink_demo.py"
 
     ``` py linenums="1"
-    --8<-- "examples/object_states/heat_source_or_sink_demo.py"
+    --8<-- "examples/wip/heat_source_or_sink_demo.py"
     ```
 
 ### **Temperature Demo**
@@ -556,7 +554,7 @@ python -m omnigibson.examples.object_states.particle_applier_remover_demo
     --8<-- "examples/object_states/particle_applier_remover_demo.py"
     ```
 
-### **Particle Source and Sink Demo**
+### **Particle Source and Sink Demo** [WIP]
 
 <div class="grid cards" markdown>
 
@@ -572,7 +570,7 @@ python -m omnigibson.examples.object_states.particle_applier_remover_demo
 </div>
 
 ```{.python .annotate}
-python -m omnigibson.examples.object_states.particle_source_sink_demo
+python -m omnigibson.examples.wip.particle_source_sink_demo
 ```
 
 ??? note "Difference between `ParticleApplier/Removers` and `ParticleSource/Sinks`"
@@ -586,7 +584,7 @@ python -m omnigibson.examples.object_states.particle_source_sink_demo
 ??? code "particle_source_sink_demo.py"
 
     ``` py linenums="1"
-    --8<-- "examples/object_states/particle_source_sink_demo.py"
+    --8<-- "examples/wip/particle_source_sink_demo.py"
     ```
 
 ### **Kinematics Demo**

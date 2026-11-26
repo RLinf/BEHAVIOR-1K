@@ -53,6 +53,7 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
 
         # Store other internal vars that will be populated at runtime
         self._loaded = False
+        self._num_envs = None
         self._reward = None
         self._done = None
         self._success = None
@@ -111,12 +112,15 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
         """
         Load this task
         """
-        # Make sure the scene is of the correct type!
-        assert any([issubclass(env.scene.__class__, valid_cls) for valid_cls in self.valid_scene_types]), (
-            f"Got incompatible scene type {env.scene.__class__.__name__} for task {self.__class__.__name__}! "
-            f"Scene class must be a subclass of at least one of: "
-            f"{[cls_type.__name__ for cls_type in self.valid_scene_types]}"
-        )
+        self._num_envs = env.num_envs
+
+        # Make sure all scenes are of the correct type!
+        for scene in env.scenes:
+            assert any([issubclass(scene.__class__, valid_cls) for valid_cls in self.valid_scene_types]), (
+                f"Got incompatible scene type {scene.__class__.__name__} for task {self.__class__.__name__}! "
+                f"Scene class must be a subclass of at least one of: "
+                f"{[cls_type.__name__ for cls_type in self.valid_scene_types]}"
+            )
 
         # Run internal method
         self._load(env=env)
@@ -131,11 +135,13 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
         Args:
             env (Environment): environment instance
         """
-        # Reset the scene to its initial stored configuration by default
-        env.scene.reset(hard=False)
+        # Reset all scenes to their initial stored configuration
+        for scene in env.scenes:
+            scene.reset(hard=False)
 
-        # Compute the low dimensional observation dimension
-        obs = self.get_obs(env=env, flatten_low_dim=False)
+        # Compute the low dimensional observation dimension. Obs keys and shape are task-defined
+        # and identical across envs, so env 0 is canonical.
+        obs = self.get_obs(env=env, env_idx=0, flatten_low_dim=False)
         if "low_dim" in obs:
             self._low_dim_obs_keys = list(obs["low_dim"].keys())
             self._low_dim_obs_dim = len(self._flatten_low_dim_obs(obs=obs["low_dim"]))
@@ -173,130 +179,156 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
         """
         raise NotImplementedError()
 
-    def _reset_scene(self, env):
+    def _reset_scene(self, env, env_indices):
         """
-        Task-specific scene reset. Default is the normal scene reset
+        Task-specific scene reset. Default is resetting specified scenes.
 
         Args:
             env (Environment): environment instance
+            env_indices (th.Tensor): Indices of environments to reset
         """
-        env.scene.reset()
+        for idx in env_indices:
+            env.scenes[idx].reset()
 
-    def _reset_agent(self, env):
+    def _reset_agent(self, env, env_indices):
         """
         Task-specific agent reset
 
         Args:
             env (Environment): environment instance
+            env_indices (th.Tensor): Indices of environments to reset
         """
         # Default is no-op
         pass
 
-    def _reset_variables(self, env):
+    def _reset_variables(self, env, env_indices):
         """
         Task-specific internal variable reset
 
         Args:
             env (Environment): environment instance
+            env_indices (th.Tensor): Indices of environments to reset
         """
-        # By default, reset reward, done, and info
-        self._reward = None
-        self._done = False
-        self._success = False
-        self._info = None
+        if self._reward is None:
+            # First-time init
+            self._reward = th.zeros(self._num_envs, dtype=th.float32)
+            self._done = th.zeros(self._num_envs, dtype=th.bool)
+            self._success = th.zeros(self._num_envs, dtype=th.bool)
+        self._reward[env_indices] = 0.0
+        self._done[env_indices] = False
+        self._success[env_indices] = False
+        if len(env_indices) == self._num_envs:
+            self._info = None  # info is rebuilt each step
+        elif self._info is not None:
+            for idx in env_indices:
+                self._info[idx] = {}
 
-    def reset(self, env):
+    def reset(self, env, env_indices=None):
         """
         Resets this task in the environment
 
         Args:
             env (Environment): environment instance to reset
+            env_indices (None or th.Tensor): Indices of environments to reset. If None, resets all.
         """
+        if env_indices is None:
+            env_indices = th.arange(self._num_envs)
+
         # Reset the scene, agent, and variables
-        self._reset_scene(env)
-        self._reset_agent(env)
-        self._reset_variables(env)
+        self._reset_scene(env, env_indices)
+        self._reset_agent(env, env_indices)
+        self._reset_variables(env, env_indices)
 
         # Also reset all termination conditions and reward functions
         for termination_condition in self._termination_conditions.values():
-            termination_condition.reset(self, env)
+            termination_condition.reset(self, env, env_indices)
         for reward_function in self._reward_functions.values():
-            reward_function.reset(self, env)
+            reward_function.reset(self, env, env_indices)
 
-    def _step_termination(self, env, action, info=None):
+    def _step_termination(self, env, action, infos=None, env_indices=None):
         """
         Step and aggregate termination conditions
 
         Args:
             env (Environment): Environment instance
-            action (n-array): 1D flattened array of actions executed by all agents in the environment
-            info (None or dict): Any info to return
+            action (n-array): One action row per selected scene
+            env_indices (sequence of int, optional): Scene indices in action and result order
+            infos (None or list[dict]): If provided, a list of per-env info dicts to accumulate into.
+                If None, fresh info dicts are created.
 
         Returns:
             2-tuple:
-                - float: aggregated termination at the current timestep
-                - dict: any information passed through this function or generated by this function
+                - th.Tensor: (num_selected,) bool tensor of dones
+                - list[dict]: per-env info dicts
         """
         # Get all dones and successes from individual termination conditions
-        dones = []
-        successes = []
-        info = dict() if info is None else info
-        if "termination_conditions" not in info:
-            info["termination_conditions"] = dict()
+        num_rows = self._num_envs if env_indices is None else len(env_indices)
+        step_kwargs = {} if env_indices is None else {"env_indices": env_indices}
+        if infos is not None:
+            for i in range(num_rows):
+                if "termination_conditions" not in infos[i]:
+                    infos[i]["termination_conditions"] = dict()
+        else:
+            infos = [{"termination_conditions": dict()} for _ in range(num_rows)]
+        dones = th.zeros(num_rows, dtype=th.bool)
+        successes = th.zeros(num_rows, dtype=th.bool)
+
         for name, termination_condition in self._termination_conditions.items():
-            d, s = termination_condition.step(self, env, action)
-            dones.append(d)
-            successes.append(s)
-            info["termination_conditions"][name] = {
-                "done": d,
-                "success": s,
-            }
-        # Any True found corresponds to a done / success
-        done = sum(dones) > 0
-        success = sum(successes) > 0
+            d, s = termination_condition.step(self, env, action, **step_kwargs)
+            dones = dones | d
+            successes = successes | s
+            for env_idx in range(num_rows):
+                infos[env_idx]["termination_conditions"][name] = {
+                    "done": d[env_idx].item(),
+                    "success": s[env_idx].item(),
+                }
 
-        # Populate info
-        info["success"] = success
-        return done, info
+        for env_idx in range(num_rows):
+            infos[env_idx]["success"] = successes[env_idx].item()
 
-    def _step_reward(self, env, action, info=None):
+        return dones, infos
+
+    def _step_reward(self, env, action, infos=None, env_indices=None):
         """
         Step and aggregate reward functions
 
         Args:
             env (Environment): Environment instance
-            action (n-array): 1D flattened array of actions executed by all agents in the environment
-            info (None or dict): Any info to return
+            action (n-array): One action row per selected scene
+            env_indices (sequence of int, optional): Scene indices in action and result order
+            infos (None or list[dict]): If provided, a list of per-env info dicts to accumulate into.
+                If None, fresh info dicts are created.
 
         Returns:
             2-tuple:
-                - float: aggregated reward at the current timestep
-                - dict: any information passed through this function or generated by this function
+                - th.Tensor: (num_selected,) float tensor of total rewards
+                - list[dict]: per-env info dicts
         """
-        # Make sure info is a dict
-        total_info = dict() if info is None else info
-        # We'll also store individual reward split as well
-        breakdown_dict = dict()
         # Aggregate rewards over all reward functions
-        total_reward = 0.0
+        num_rows = self._num_envs if env_indices is None else len(env_indices)
+        step_kwargs = {} if env_indices is None else {"env_indices": env_indices}
+        infos = infos if infos is not None else [dict() for _ in range(num_rows)]
+        total_rewards = th.zeros(num_rows, dtype=th.float32)
+
         for reward_name, reward_function in self._reward_functions.items():
-            reward, reward_info = reward_function.step(self, env, action)
-            total_reward += reward
-            breakdown_dict[reward_name] = reward
-            total_info[reward_name] = reward_info
+            rewards, reward_infos = reward_function.step(self, env, action, **step_kwargs)
+            total_rewards += rewards
+            for env_idx in range(num_rows):
+                infos[env_idx][reward_name] = reward_infos[env_idx]
+                if "reward_breakdown" not in infos[env_idx]:
+                    infos[env_idx]["reward_breakdown"] = dict()
+                infos[env_idx]["reward_breakdown"][reward_name] = rewards[env_idx].item()
 
-        # Store breakdown dict
-        total_info["reward_breakdown"] = breakdown_dict
-
-        return total_reward, total_info
+        return total_rewards, infos
 
     @abstractmethod
-    def _get_obs(self, env):
+    def _get_obs(self, env, env_idx):
         """
-        Get task-specific observation
+        Get task-specific observation for a specific environment
 
         Args:
             env (Environment): Environment instance
+            env_idx (int): Index of the environment
 
         Returns:
             2-tuple:
@@ -319,54 +351,69 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
         # By default, we simply concatenate all values in our obs dict
         return th.cat([ob for ob in obs.values()]) if len(obs.values()) > 0 else th.empty(0)
 
-    def get_obs(self, env, flatten_low_dim=True):
-        # Args: env (Environment): environment instance
-        # Args: flatten_low_dim (bool): Whether to flatten low-dimensional observations
-
-        if not self._include_obs:
-            return dict()
-
-        # Grab obs internally
-        low_dim_obs, obs = self._get_obs(env=env)
-
-        # Possibly flatten low dim and add to main observation dictionary
-        if low_dim_obs:
-            obs["low_dim"] = self._flatten_low_dim_obs(obs=low_dim_obs) if flatten_low_dim else low_dim_obs
-
-        return obs
-
-    def step(self, env, action):
+    def get_obs(self, env, env_idx=None, flatten_low_dim=True):
         """
-        Perform task-specific step for every timestep
+        Get task observations.
+
+        Args:
+            env (Environment): environment instance
+            env_idx (int or None): If specified, return obs for one env. If None, return list for all envs.
+            flatten_low_dim (bool): Whether to flatten low-dimensional observations
+        """
+        if not self._include_obs:
+            return dict() if env_idx is not None else [dict()] * self._num_envs
+
+        if env_idx is not None:
+            low_dim_obs, obs = self._get_obs(env=env, env_idx=env_idx)
+            if low_dim_obs:
+                obs["low_dim"] = self._flatten_low_dim_obs(obs=low_dim_obs) if flatten_low_dim else low_dim_obs
+            return obs
+        else:
+            return [self.get_obs(env, env_idx=i, flatten_low_dim=flatten_low_dim) for i in range(self._num_envs)]
+
+    def step(self, env, action, env_indices=None):
+        """
+        Step the task for all scenes or for the specified scenes in the given order.
 
         Args:
             env (Environment): Environment instance
-            action (n-array): 1D flattened array of actions executed by all agents in the environment
+            action (n-array): One action row per selected scene
+            env_indices (sequence of int, optional): Scene indices corresponding to the action rows
 
         Returns:
             3-tuple:
-                - float: reward calculated after this step
-                - bool: whether task is done or not
-                - dict: nested dictionary of reward- and done-related info
+                - th.Tensor: (num_selected,) reward tensor
+                - th.Tensor: (num_selected,) done bool tensor
+                - list[dict]: per-env info dicts
         """
         # Make sure we're initialized
         assert self._loaded, "Task must be loaded using load() before calling step()!"
 
         # We calculate termination conditions first and then rewards
         # (since some rewards can rely on termination conditions to update)
-        done, done_info = self._step_termination(env=env, action=action)
-        reward, reward_info = self._step_reward(env=env, action=action)
+        step_kwargs = {} if env_indices is None else {"env_indices": env_indices}
+        dones, done_infos = self._step_termination(env=env, action=action, **step_kwargs)
+        rewards, reward_infos = self._step_reward(env=env, action=action, **step_kwargs)
 
         # Update the internal state of this task
-        self._reward = reward
-        self._done = done
-        self._success = done_info["success"]
-        self._info = {
-            "reward": reward_info,
-            "done": done_info,
-        }
+        successes = th.tensor([di["success"] for di in done_infos], dtype=th.bool)
+        infos = [{"reward": r, "done": d} for r, d in zip(reward_infos, done_infos)]
+        if env_indices is None:
+            # A subsequent indexed step or automatic reset updates these caches in place.
+            self._reward = rewards.clone()
+            self._done = dones.clone()
+            self._success = successes
+            self._info = infos
+        else:
+            self._reward[env_indices] = rewards
+            self._done[env_indices] = dones
+            self._success[env_indices] = successes
+            if self._info is None:
+                self._info = [{} for _ in range(self._num_envs)]
+            for idx, info in zip(env_indices, infos):
+                self._info[idx] = info
 
-        return self._reward, self._done, deepcopy(self._info)
+        return rewards, dones, deepcopy(infos)
 
     @property
     def name(self):
@@ -380,7 +427,7 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
     def reward(self):
         """
         Returns:
-            float: Current reward for this task
+            th.Tensor: (num_envs,) current reward tensor for this task
         """
         assert self._reward is not None, "At least one step() must occur before reward can be calculated!"
         return self._reward
@@ -389,7 +436,7 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
     def done(self):
         """
         Returns:
-            bool: Whether this task is done or not
+            th.Tensor: (num_envs,) bool tensor of whether each env is done
         """
         assert self._done is not None, "At least one step() must occur before done can be calculated!"
         return self._done
@@ -398,7 +445,7 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
     def success(self):
         """
         Returns:
-            bool: Whether this task has succeeded or not
+            th.Tensor: (num_envs,) bool tensor of whether each env has succeeded
         """
         assert self._success is not None, "At least one step() must occur before success can be calculated!"
         return self._success
@@ -407,7 +454,7 @@ class BaseTask(GymObservable, Registerable, metaclass=ABCMeta):
     def info(self):
         """
         Returns:
-            dict: Nested dictionary of information for this task, including reward- and done-specific information
+            list[dict]: Per-env nested dictionary of information for this task, including reward- and done-specific information
         """
         assert self._info is not None, "At least one step() must occur before info can be calculated!"
         return self._info

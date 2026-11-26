@@ -13,7 +13,7 @@ long_description = "".join(lines)
 
 setup(
     name="omnigibson",
-    version="3.7.1",
+    version="3.9.3",
     author="Stanford University",
     long_description_content_type="text/markdown",
     long_description=long_description,
@@ -24,6 +24,8 @@ setup(
         "huggingface-hub[cli]>=0.34.4",
         "gymnasium>=0.28.1",
         "numpy<2.0.0,>=1.23.5",
+        # pyarrow 26 drops numpy 1.x support, but isaacsim-kernel pins numpy==1.26.0.
+        "pyarrow<26",
         "scipy>=1.10.1",
         "GitPython>=3.1.40",
         "transforms3d>=0.4.1",
@@ -42,7 +44,8 @@ setup(
         "imageio-ffmpeg>=0.4.9",
         "termcolor>=2.4.0",
         "progressbar>=2.5",
-        "pymeshlab~=2022.2",
+        "pymeshlab~=2022.2; platform_machine!='aarch64'",
+        "pymeshlab>=2022.2; platform_machine=='aarch64'",
         "click>=8.1.3",
         "aenum>=3.1.15",
         "rtree>=1.2.0",
@@ -50,14 +53,19 @@ setup(
         "matplotlib>=3.0.0",
         "lxml>=5.2.2",
         "numba>=0.59.1",
-        "cffi~=1.17.1",
+        "cffi==1.17.1",
         "pillow~=11.0.0",
+        "websockets>=15.0.1",
+        "omegaconf>=2.3.0",
+        # release/b1k-challenge-2026: Python 3.11 / NumPy 1.x compatible challenge release.
+        "lerobot[dataset] @ git+https://github.com/wensi-ai/lerobot@436812bd8ee39b768c645c248c91f1330834e687",
     ],
     extras_require={
         "dev": [
             "pytest>=6.2.3",
             "pytest-cov>=3.0.0",
             "pytest_rerunfailures",
+            "pyright>=1.1.390",
             "mkdocs",
             "mkdocs-autorefs",
             "mkdocs-gen-files",
@@ -73,15 +81,13 @@ setup(
         ],
         "primitives": [
             "ninja~=1.13.0",
-            "nvidia-curobo @ git+https://github.com/StanfordVL/curobo@cbaf7d32436160956dad190a9465360fad6aba73",
-            "ompl @ https://storage.googleapis.com/gibson_scenes/ompl-1.6.0-cp310-cp310-manylinux_2_28_x86_64.whl",
+            "warp-lang==1.12.0",
+            "nvidia-curobo @ git+https://github.com/StanfordVL/curobo@78612f45cef52c3fa0298de243a54cd7ca614414",
         ],
         "eval": [
             "dm_tree>=0.1.9",
             "hydra-core>=1.3.2",
-            "websockets>=15.0.1",
             "msgpack>=1.1.0",
-            "lerobot @ git+https://github.com/huggingface/lerobot@577cd10974b84bea1f06b6472eb9e5e74e07f77a",
             "gspread>=6.2.1",
             "open3d>=0.19.0",
         ]

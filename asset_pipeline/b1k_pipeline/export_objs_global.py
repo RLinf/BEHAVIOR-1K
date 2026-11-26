@@ -6,9 +6,9 @@ import logging
 import os
 import traceback
 import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from xml.dom import minidom
 
-from dask.distributed import LocalCluster, as_completed
 import fs.copy
 from fs.tempfs import TempFS
 from fs.osfs import OSFS
@@ -27,7 +27,7 @@ from b1k_pipeline.utils import (
     save_mesh,
 )
 
-from bddl.object_taxonomy import ObjectTaxonomy
+from bddl.knowledge_base import KnowledgeBase
 
 logger = logging.getLogger("trimesh")
 logger.setLevel(logging.ERROR)
@@ -67,11 +67,13 @@ LOG_SURFACE_AREA_RANGE = (-6, 4)
 LOG_TEXTURE_RANGE = (4, 11)
 
 
-def get_required_meta_links(object_taxonomy, category):
-    synset = object_taxonomy.get_synset_from_category_or_substance(category)
+def get_required_meta_links(kb, category):
+    cat = kb.get_category(category)
+    ps = kb.get_particle_system(category)
+    synset = cat.synset if cat else (ps.synset if ps else None)
     if synset is None:
         raise ValueError(f"Category {category} not found in taxonomy.")
-    return object_taxonomy.get_required_meta_links_for_synset(synset)
+    return synset.required_meta_links
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -293,7 +295,9 @@ def process_link(
             material_maps = G.nodes[link_node]["material_maps"]
             moved_material_maps = {}
             for map_channel, map_path in material_maps.items():
-                assert os.path.exists(map_path), f"Texture file {map_path} does not exist!"
+                assert os.path.exists(
+                    map_path
+                ), f"Texture file {map_path} does not exist!"
 
                 # Convert the path to a dirname + filename so that we can use an OSFS
                 # to copy the file.
@@ -304,7 +308,9 @@ def process_link(
 
                 assert map_channel in CHANNEL_MAPPING, f"Unknown channel {map_channel}"
                 dst_fname, _ = CHANNEL_MAPPING[map_channel]
-                dst_texture_filename = f"{model_id}__{link_name}__{dst_fname}{src_map_ext}"
+                dst_texture_filename = (
+                    f"{model_id}__{link_name}__{dst_fname}{src_map_ext}"
+                )
 
                 # Load the image
                 # TODO: Re-enable this after tuning it.
@@ -344,7 +350,9 @@ def process_link(
                 canonical_convex_mesh._cache.cache["vertex_normals"] = (
                     canonical_convex_mesh.vertex_normals
                 )
-                convex_filename = obj_relative_path.replace(".obj", f"__{convex_mesh_type}__{i}.obj")
+                convex_filename = obj_relative_path.replace(
+                    ".obj", f"__{convex_mesh_type}__{i}.obj"
+                )
                 obj_link_convex_mesh_folder_fs = obj_link_mesh_folder_fs.makedir(
                     convex_mesh_type, recreate=True
                 )
@@ -353,7 +361,9 @@ def process_link(
                     obj_link_convex_mesh_folder_fs,
                     convex_filename,
                 )
-                convex_mesh_filenames_and_scales[convex_mesh_type].append((convex_filename, convex_scale))
+                convex_mesh_filenames_and_scales[convex_mesh_type].append(
+                    (convex_filename, convex_scale)
+                )
                 canonical_convex_meshes[convex_mesh_type].append(canonical_convex_mesh)
 
         # Store the final meshes
@@ -382,7 +392,10 @@ def process_link(
                 for line in f.readlines():
                     if "map_Kd material_0.png" in line:
                         line = ""
-                        for channel_name, channel_filename in moved_material_maps.items():
+                        for (
+                            channel_name,
+                            channel_filename,
+                        ) in moved_material_maps.items():
                             _, mtl_key = CHANNEL_MAPPING[channel_name]
                             line += f"{mtl_key} ../../material/{channel_filename}\n"
                     new_lines.append(line)
@@ -407,7 +420,9 @@ def process_link(
     }
 
     collision_origin_xmls = []
-    for collision_filename, collision_scale in convex_mesh_filenames_and_scales["collision"]:
+    for collision_filename, collision_scale in convex_mesh_filenames_and_scales[
+        "collision"
+    ]:
         collision_xml = ET.SubElement(link_xml, "collision")
         collision_xml.attrib = {"name": collision_filename.replace(".obj", "")}
         collision_origin_xml = ET.SubElement(collision_xml, "origin")
@@ -417,9 +432,9 @@ def process_link(
         collision_geometry_xml = ET.SubElement(collision_xml, "geometry")
         collision_mesh_xml = ET.SubElement(collision_geometry_xml, "mesh")
         collision_mesh_xml.attrib = {
-            "filename": os.path.join("..", "shape", "collision", collision_filename).replace(
-                "\\", "/"
-            ),
+            "filename": os.path.join(
+                "..", "shape", "collision", collision_filename
+            ).replace("\\", "/"),
             "scale": " ".join([str(item) for item in collision_scale]),
         }
         collision_origin_xmls.append(collision_origin_xml)
@@ -458,7 +473,7 @@ def process_link(
         joint_xml = ET.SubElement(tree_root, "joint")
         joint_xml.attrib = {
             "name": f"j_{child_node[3]}",
-            "type": {"P": "prismatic", "R": "revolute", "F": "fixed"}[joint_type],
+            "type": {"P": "prismatic", "R": "revolute", "F": "fixed", "C": "continuous"}[joint_type],
         }
 
         joint_parent_xml = ET.SubElement(joint_xml, "parent")
@@ -467,14 +482,14 @@ def process_link(
         joint_child_xml.attrib = {"link": child_node[3]}
 
         mesh_offset = np.zeros(3)
-        if joint_type in ("P", "R"):
+        if joint_type in ("P", "R", "C"):
             upper_canonical_points = transform_points(
                 G.nodes[child_node]["upper_points"],
                 base_link_center + rotated_parent_frame,
                 canonical_orientation,
             )
 
-            if joint_type == "R":
+            if joint_type in ("R", "C"):
                 # Revolute joint
                 num_v_lower = lower_canonical_points.shape[0]
                 num_v_upper = upper_canonical_points.shape[0]
@@ -557,8 +572,9 @@ def process_link(
             joint_axis_xml.attrib = {
                 "xyz": " ".join([str(item) for item in joint_axis])
             }
-            joint_limit_xml = ET.SubElement(joint_xml, "limit")
-            joint_limit_xml.attrib = {"lower": str(0.0), "upper": str(upper_limit)}
+            if joint_type != "C":  # Continuous joints do not have limits
+                joint_limit_xml = ET.SubElement(joint_xml, "limit")
+                joint_limit_xml.attrib = {"lower": str(0.0), "upper": str(upper_limit)}
         else:
             # Fixed joints are quite simple.
             joint_origin = child_center
@@ -657,11 +673,9 @@ def process_link(
                 ),
                 "scale": " ".join([str(item) for item in cm_scale]),
             }
-            
+
     # Filter non-required meta links
-    found_nonoptional_meta_types = (
-        set(meta_links.keys()) & REQUIRED_ONLY_META_TYPES
-    )
+    found_nonoptional_meta_types = set(meta_links.keys()) & REQUIRED_ONLY_META_TYPES
     found_extra_nonoptional_meta_types = (
         found_nonoptional_meta_types - required_meta_types
     )
@@ -670,8 +684,9 @@ def process_link(
             del meta_links[extra_meta_type]
 
     # Assert no CoM meta link anywhere except the base link
-    assert not ("com" in meta_links and link_name != "base_link"), \
-        f"CoM meta link found in {link_name} of {link_node}. Only base link should have CoM."
+    assert not (
+        "com" in meta_links and link_name != "base_link"
+    ), f"CoM meta link found in {link_name} of {link_node}. Only base link should have CoM."
 
     out_metadata["meta_links"][link_name] = meta_links
     out_metadata["link_tags"][link_name] = G.nodes[link_node]["tags"]
@@ -684,16 +699,14 @@ def process_object(root_node, target, relevant_nodes, requried_meta_types, outpu
         target,
         filter_nodes=relevant_nodes,
     )
-    
+
     with OSFS(output_dir) as output_fs:
         # Prepare the URDF tree
         tree_root = ET.Element("robot")
         tree_root.attrib = {"name": obj_model}
 
         # Extract base link orientation and position
-        canonical_orientation = np.array(
-            G.nodes[root_node]["canonical_orientation"]
-        )
+        canonical_orientation = np.array(G.nodes[root_node]["canonical_orientation"])
         base_link_mesh = G.nodes[root_node]["lower_mesh"]
         base_link_center = get_mesh_center(base_link_mesh)
 
@@ -717,9 +730,7 @@ def process_object(root_node, target, relevant_nodes, requried_meta_types, outpu
             )
 
         # Save the URDF file.
-        xmlstr = minidom.parseString(ET.tostring(tree_root)).toprettyxml(
-            indent="   "
-        )
+        xmlstr = minidom.parseString(ET.tostring(tree_root)).toprettyxml(indent="   ")
         xmlio = io.StringIO(xmlstr)
         tree = ET.parse(xmlio)
 
@@ -730,14 +741,20 @@ def process_object(root_node, target, relevant_nodes, requried_meta_types, outpu
         bbox_size = np.array(G.nodes[root_node]["object_bounding_box"]["extent"])
         bbox_world_pos = np.array(G.nodes[root_node]["object_bounding_box"]["position"])
         base_link_offset_in_world = bbox_world_pos - base_link_center
-        base_link_offset = R.from_quat(canonical_orientation).inv().apply(base_link_offset_in_world)
+        base_link_offset = (
+            R.from_quat(canonical_orientation).inv().apply(base_link_offset_in_world)
+        )
 
         # Compute part information
         for part_node_key in get_part_nodes(G, root_node):
             # Get the part node bounding box
             part_bb_size = G.nodes[part_node_key]["object_bounding_box"]["extent"]
-            part_bb_in_world_pos = G.nodes[part_node_key]["object_bounding_box"]["position"]
-            part_bb_in_world_rot = R.from_quat(G.nodes[part_node_key]["object_bounding_box"]["rotation"])
+            part_bb_in_world_pos = G.nodes[part_node_key]["object_bounding_box"][
+                "position"
+            ]
+            part_bb_in_world_rot = R.from_quat(
+                G.nodes[part_node_key]["object_bounding_box"]["rotation"]
+            )
 
             # Convert into our base link frame
             our_transform = np.eye(4)
@@ -781,9 +798,7 @@ def process_object(root_node, target, relevant_nodes, requried_meta_types, outpu
 
                 # pretend that the attachment point is at the center of the part bbox with its transform
                 # actually add the point
-                base_link_meta_links["attachment"][attachment_type][
-                    str(next_id)
-                ] = {
+                base_link_meta_links["attachment"][attachment_type][str(next_id)] = {
                     "position": bb_pos_in_our,
                     "orientation": bb_quat_in_our,
                 }
@@ -808,7 +823,8 @@ def process_object(root_node, target, relevant_nodes, requried_meta_types, outpu
         openable_joint_ids = [
             (i, joint.attrib["name"])
             for i, joint in enumerate(tree.findall("joint"))
-            if "openable" in out_metadata["link_tags"].get(joint.find("child").attrib["link"], [])
+            if "openable"
+            in out_metadata["link_tags"].get(joint.find("child").attrib["link"], [])
         ]
 
         # If there is a center of mass annotation for the base link, we need to pop it to store it
@@ -842,7 +858,7 @@ def process_object(root_node, target, relevant_nodes, requried_meta_types, outpu
             json.dump(out_metadata, f, cls=NumpyEncoder)
 
 
-def process_target(target, objects_path, object_taxonomy, model_whitelist, dask_client):
+def process_target(target, objects_path, kb, model_whitelist, executor):
     object_futures = {}
 
     # Build the mesh tree using our mesh tree library. The scene code also uses this system.
@@ -855,7 +871,9 @@ def process_target(target, objects_path, object_taxonomy, model_whitelist, dask_
     saveable_roots = [
         root_node
         for root_node in roots
-        if int(root_node[2]) == 0 and not G.nodes[root_node]["is_broken"] and (not model_whitelist or root_node[1] in model_whitelist)
+        if int(root_node[2]) == 0
+        and not G.nodes[root_node]["is_broken"]
+        and (not model_whitelist or root_node[1] in model_whitelist)
     ]
     for root_node in saveable_roots:
         # Start processing the object. We start by creating an object-specific
@@ -874,12 +892,12 @@ def process_target(target, objects_path, object_taxonomy, model_whitelist, dask_
         output_dirname_abs = os.path.join(objects_path, output_dirname)
         os.makedirs(output_dirname_abs, exist_ok=True)
         object_futures[
-            dask_client.submit(
+            executor.submit(
                 process_object,
                 root_node,
                 target,
                 relevant_nodes,
-                get_required_meta_links(object_taxonomy, obj_cat),
+                get_required_meta_links(kb, obj_cat),
                 output_dirname_abs,
             )
         ] = str(root_node)
@@ -888,7 +906,7 @@ def process_target(target, objects_path, object_taxonomy, model_whitelist, dask_
 
 
 def main():
-    object_taxonomy = ObjectTaxonomy()
+    kb = KnowledgeBase(populate=True)
 
     # If this variable is set, we will only export the models in this list. This is useful for quickly
     # iterating on scenes (usdify otherwise takes 8+ hours). If this list is empty, we will export all models.
@@ -927,22 +945,28 @@ def main():
         # Load the mesh list from the object list json.
         errors = {}
 
-        cluster = LocalCluster()
-        dask_client = cluster.get_client()
-
         targets = get_targets("combined")
 
         obj_futures = {}
 
-        for target in tqdm.tqdm(targets, desc="Processing targets to queue objects"):
-            obj_futures.update(process_target(target, objects_dir, object_taxonomy, model_whitelist, dask_client))
+        with ProcessPoolExecutor() as executor:
+            for target in tqdm.tqdm(targets, desc="Processing targets to queue objects"):
+                obj_futures.update(
+                    process_target(
+                        target, objects_dir, kb, model_whitelist, executor
+                    )
+                )
 
-        for future in tqdm.tqdm(as_completed(obj_futures.keys()), total=len(obj_futures), desc="Processing objects"):
-            try:
-                future.result()
-            except:
-                name = obj_futures[future]
-                errors[name] = traceback.format_exc()
+            for future in tqdm.tqdm(
+                as_completed(obj_futures.keys()),
+                total=len(obj_futures),
+                desc="Processing objects",
+            ):
+                try:
+                    future.result()
+                except:
+                    name = obj_futures[future]
+                    errors[name] = traceback.format_exc()
 
         print("Finished processing")
 

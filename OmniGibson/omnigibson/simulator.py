@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -9,29 +10,29 @@ import socket
 import sys
 import tempfile
 import traceback
-from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
+from omnigibson.utils.profiling_utils import Profiler
 
 import torch as th
+import warp as wp
 
 import omnigibson as og
 import omnigibson.lazy as lazy
 from omnigibson.macros import create_module_macros, gm
-from omnigibson.object_states.contact_subscribed_state_mixin import ContactSubscribedStateMixin
 from omnigibson.object_states.factory import get_states_by_dependency_order
 from omnigibson.object_states.joint_break_subscribed_state_mixin import JointBreakSubscribedStateMixin
-from omnigibson.object_states.update_state_mixin import GlobalUpdateStateMixin, UpdateStateMixin
-from omnigibson.objects.controllable_object import ControllableObject
+from omnigibson.object_states.tensorized_state import TensorizedState
+from omnigibson.object_states.update_state_mixin import UpdateStateMixin
 from omnigibson.objects.light_object import LightObject
-from omnigibson.objects.object_base import BaseObject
-from omnigibson.objects.stateful_object import StatefulObject
+from omnigibson.objects.usd_object import USDObject
 from omnigibson.prims import XFormPrim
 from omnigibson.prims.material_prim import MaterialPrim
 from omnigibson.scenes import Scene
+from omnigibson.sensors.tiled_sensor import TiledVisionSensor
 from omnigibson.sensors.vision_sensor import VisionSensor
 from omnigibson.systems.macro_particle_system import MacroPhysicalParticleSystem
-from omnigibson.utils.asset_utils import get_dataset_path
+from omnigibson.utils.asset_utils import ensure_omnigibson_robot_assets_version, get_dataset_path
 from omnigibson.utils.constants import LightingMode
 from omnigibson.utils.python_utils import Serializable
 from omnigibson.utils.python_utils import clear as clear_python_utils
@@ -45,15 +46,17 @@ from omnigibson.utils.ui_utils import (
     print_logo,
     suppress_omni_log,
 )
+from omnigibson.utils.vision_utils import add_semantic_label
 from omnigibson.utils.usd_utils import (
+    ArticulatedObjectViewAPI,
     CollisionAPI,
     ControllableObjectViewAPI,
-    GripperRigidContactAPI,
-    PoseAPI,
+    RigidBodyViewAPI,
     RigidContactAPI,
+    clear as clear_usd_utils,
+    triangularize_mesh,
 )
-from omnigibson.utils.usd_utils import clear as clear_usd_utils
-from omnigibson.utils.usd_utils import triangularize_mesh
+from omnigibson.controllers import ControllerView
 
 # Create module logger
 log = create_module_logger(module_name=__name__)
@@ -70,7 +73,42 @@ m.SCENE_MARGIN = 10.0
 m.INITIAL_SCENE_PRIM_Z_OFFSET = -100.0
 
 m.KIT_FILES = {
-    (4, 5, 0): "omnigibson_4_5_0.kit",
+    (5, 1, 0): "omnigibson_5_1_0.kit",
+}
+
+
+def with_profiler(name):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            profiler = getattr(self, name)
+            profiler.enable()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                profiler.disable()
+
+        return wrapper
+
+    return decorator
+
+
+# Create module logger
+log = create_module_logger(module_name=__name__)
+
+# Create settings for this module
+m = create_module_macros(module_path=__file__)
+
+m.DEFAULT_VIEWER_CAMERA_POS = (-0.201028, -2.72566, 1.0654)
+m.DEFAULT_VIEWER_CAMERA_QUAT = (0.68196617, -0.00155408, -0.00166678, 0.73138017)
+
+m.OBJECT_GRAVEYARD_POS = (100.0, 100.0, 100.0)
+
+m.SCENE_MARGIN = 10.0
+m.INITIAL_SCENE_PRIM_Z_OFFSET = -100.0
+
+m.KIT_FILES = {
+    (5, 1, 0): "omnigibson_5_1_0.kit",
 }
 
 
@@ -148,89 +186,122 @@ class SuppressLogsUntilError:
 def _launch_app():
     log.setLevel(logging.DEBUG if gm.DEBUG else logging.INFO)
 
+    # ensure that the omnigibson robot assets are up to date
+    ensure_omnigibson_robot_assets_version()
+
     log.info(f"{'-' * 5} Starting {logo_small()}. This will take 10-30 seconds... {'-' * 5}")
 
     # If multi_gpu is used, og.sim.render() will cause a segfault when called during on_contact callbacks,
     # e.g. when an attachment joint is being created due to contacts (create_joint calls og.sim.render() internally).
     gpu_id = None if gm.GPU_ID is None else int(gm.GPU_ID)
-    config_kwargs = {"headless": gm.HEADLESS or bool(gm.REMOTE_STREAMING), "multi_gpu": False}
+    config_kwargs = {
+        "headless": gm.HEADLESS or bool(gm.REMOTE_STREAMING),
+        "multi_gpu": False,
+        "extra_args": [
+            "--/plugins/carb.tasking.plugin/threadCount=8",
+            "--/plugins/omni.tbb.globalcontrol/maxThreadCount=4",
+        ],
+    }
+
     if gpu_id is not None:
         config_kwargs["active_gpu"] = gpu_id
         config_kwargs["physics_gpu"] = gpu_id
 
-    # Omni's logging is super annoying and overly verbose, so suppress it by modifying the logging levels
-    if not gm.DEBUG:
-        import warnings
+    # Clear the argv - Isaac Sim unfortunately reads from it directly, so we need to clear it to avoid issues.
+    # Otherwise it will inherit the arguments of the entrypoint script.
+    _saved_argv = sys.argv[:]
+    try:
+        sys.argv = [
+            _saved_argv[0]
+        ]  # The script filename needs to be included - otherwise the first arg will get skipped.
 
+        # Omni's logging is super annoying and overly verbose, so suppress it by modifying the logging levels
+        if not gm.DEBUG:
+            import warnings
+
+            try:
+                from numba.core.errors import NumbaPerformanceWarning
+
+                warnings.simplefilter("ignore", category=NumbaPerformanceWarning)
+            except ImportError:
+                pass
+
+            # Find a more elegant way to prune omni logging
+            if gm.NO_OMNI_LOGS:
+                sys.argv.append("--/log/level=error")
+                sys.argv.append("--/log/fileLogLevel=error")
+                sys.argv.append("--/log/outputStreamLevel=error")
+
+        # Try to import the isaacsim module that only shows up in Isaac Sim 4.0.0. This ensures that
+        # if we are using the pip installed version, all the ISAAC_PATH etc. env vars are set correctly.
+        # On the regular omniverse launcher version this should not have any impact.
         try:
-            from numba.core.errors import NumbaPerformanceWarning
-
-            warnings.simplefilter("ignore", category=NumbaPerformanceWarning)
+            os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
+            import isaacsim  # noqa: F401
         except ImportError:
             pass
 
-        # Find a more elegant way to prune omni logging
-        if gm.NO_OMNI_LOGS:
-            sys.argv.append("--/log/level=error")
-            sys.argv.append("--/log/fileLogLevel=error")
-            sys.argv.append("--/log/outputStreamLevel=error")
+        # First obtain the Isaac Sim version
+        isaac_path = os.environ["ISAAC_PATH"]
+        version_file_path = os.path.join(isaac_path, "VERSION")
+        assert os.path.exists(version_file_path), f"Isaac Sim version file not found at {version_file_path}"
+        with open(version_file_path, "r") as file:
+            version_content = file.read().strip()
+            isaac_version_str = version_content.split("-")[0]
+            isaac_version_tuple = tuple(map(int, isaac_version_str.split(".")[:3]))
+            assert isaac_version_tuple in m.KIT_FILES, f"Isaac Sim version must be one of {list(m.KIT_FILES.keys())}"
+            kit_file_name = m.KIT_FILES[isaac_version_tuple]
+            if gm.ENABLE_VR:
+                kit_file_name = kit_file_name.replace(".kit", "_vr.kit")
 
-    # Try to import the isaacsim module that only shows up in Isaac Sim 4.0.0. This ensures that
-    # if we are using the pip installed version, all the ISAAC_PATH etc. env vars are set correctly.
-    # On the regular omniverse launcher version this should not have any impact.
-    try:
-        os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
-        import isaacsim  # noqa: F401
-    except ImportError:
-        pass
+        # Copy the OmniGibson kit file and icon file to the Isaac Sim apps directory. This is necessary because the Isaac Sim app
+        # expects the extensions to be reachable in the parent directory of the kit file. We copy on every launch to
+        # ensure that the kit file is always up to date.
+        assert (
+            "EXP_PATH" in os.environ
+        ), "The EXP_PATH variable is not set. Are you in an Isaac Sim installed environment?"
+        exp_path = os.environ["EXP_PATH"]
+        kit_file = Path(__file__).parent / kit_file_name
+        kit_file_target = Path(exp_path) / kit_file_name
+        icon_file = Path(__file__).parents[2] / "docs" / "assets" / "OmniGibson_logo.png"
+        icon_file_target = Path(exp_path) / "OmniGibson_logo.png"
 
-    # First obtain the Isaac Sim version
-    isaac_path = os.environ["ISAAC_PATH"]
-    version_file_path = os.path.join(isaac_path, "VERSION")
-    assert os.path.exists(version_file_path), f"Isaac Sim version file not found at {version_file_path}"
-    with open(version_file_path, "r") as file:
-        version_content = file.read().strip()
-        isaac_version_str = version_content.split("-")[0]
-        isaac_version_tuple = tuple(map(int, isaac_version_str.split(".")[:3]))
-        assert isaac_version_tuple in m.KIT_FILES, f"Isaac Sim version must be one of {list(m.KIT_FILES.keys())}"
-        kit_file_name = m.KIT_FILES[isaac_version_tuple]
+        try:
+            shutil.copyfile(kit_file, kit_file_target)
+            shutil.copyfile(icon_file, icon_file_target)
+        except Exception as e:
+            raise e from ValueError(f"Failed to copy {kit_file_name} or {icon_file.name} to Isaac Sim apps directory.")
 
-    # Copy the OmniGibson kit file and icon file to the Isaac Sim apps directory. This is necessary because the Isaac Sim app
-    # expects the extensions to be reachable in the parent directory of the kit file. We copy on every launch to
-    # ensure that the kit file is always up to date.
-    assert "EXP_PATH" in os.environ, "The EXP_PATH variable is not set. Are you in an Isaac Sim installed environment?"
-    exp_path = os.environ["EXP_PATH"]
-    kit_file = Path(__file__).parent / kit_file_name
-    kit_file_target = Path(exp_path) / kit_file_name
-    icon_file = Path(__file__).parents[2] / "docs" / "assets" / "OmniGibson_logo.png"
-    icon_file_target = Path(exp_path) / "OmniGibson_logo.png"
+        # Set the MDL search path so that our OmniGibsonVrayMtl can be found.
+        os.environ["MDL_USER_PATH"] = str((Path(__file__).parent / "materials").resolve())
 
-    try:
-        shutil.copy(kit_file, kit_file_target)
-        shutil.copy(icon_file, icon_file_target)
-    except Exception as e:
-        raise e from ValueError(f"Failed to copy {kit_file_name} or {icon_file.name} to Isaac Sim apps directory.")
+        launch_context = nullcontext if gm.DEBUG else SuppressLogsUntilError if gm.NO_OMNI_LOGS else suppress_omni_log
 
-    # Set the MDL search path so that our OmniGibsonVrayMtl can be found.
-    os.environ["MDL_USER_PATH"] = str((Path(__file__).parent / "materials").resolve())
+        # Prepare the directories where Omniverse will store its appdata (logs, caches, etc.)
+        local_appdata = Path(gm.APPDATA_PATH) / "local"
+        local_appdata.mkdir(parents=True, exist_ok=True)
+        sys.argv.extend(["--portable-root", str(local_appdata)])
 
-    launch_context = nullcontext if gm.DEBUG else SuppressLogsUntilError if gm.NO_OMNI_LOGS else suppress_omni_log
+        global_cache_dir = Path(gm.APPDATA_PATH) / "global" / "cache"
+        global_cache_dir.mkdir(parents=True, exist_ok=True)
+        sys.argv.append(f"--/app/tokens/omni_global_cache={global_cache_dir}")
 
-    # Prepare the directories where Omniverse will store its appdata (logs, caches, etc.)
-    local_appdata = Path(gm.APPDATA_PATH) / "local"
-    local_appdata.mkdir(parents=True, exist_ok=True)
-    sys.argv.extend(["--portable-root", str(local_appdata)])
+        global_data_dir = Path(gm.APPDATA_PATH) / "global" / "data"
+        global_data_dir.mkdir(parents=True, exist_ok=True)
+        sys.argv.append(f"--/app/tokens/omni_global_data={str(global_data_dir)}")
 
-    global_cache_dir = Path(gm.APPDATA_PATH) / "global" / "cache"
-    global_cache_dir.mkdir(parents=True, exist_ok=True)
-    sys.argv.append(f"--/app/tokens/omni_global_cache={global_cache_dir}")
+        # Persist warp's JIT-compiled kernel cache under gm.APPDATA_PATH so it survives
+        # across runs (warp's default ~/.cache/warp is per-user/ephemeral on some
+        # self-hosted CI runners, which means every run pays the full NVRTC JIT cost).
+        global_warp_cache_dir = Path(gm.APPDATA_PATH) / "global" / "warp_cache"
+        global_warp_cache_dir.mkdir(parents=True, exist_ok=True)
+        wp.config.kernel_cache_dir = str(global_warp_cache_dir)
 
-    global_data_dir = Path(gm.APPDATA_PATH) / "global" / "data"
-    global_data_dir.mkdir(parents=True, exist_ok=True)
-    sys.argv.append(f"--/app/tokens/omni_global_data={str(global_data_dir)}")
-
-    with launch_context(None):
-        app = lazy.isaacsim.SimulationApp(config_kwargs, experience=str(kit_file_target.resolve(strict=True)))
+        with launch_context(None):
+            app = lazy.isaacsim.SimulationApp(config_kwargs, experience=str(kit_file_target.resolve(strict=True)))
+    finally:
+        # Always restore the caller's argv, even if Isaac Sim startup raises.
+        sys.argv = _saved_argv
 
     # Close the stage so that we can create a new one when a Simulator Instance is created
     assert lazy.isaacsim.core.utils.stage.close_stage()
@@ -238,10 +309,6 @@ def _launch_app():
     # Omni overrides the global logger to be DEBUG, which is very annoying, so we re-override it to the default WARN
     # TODO: Remove this once omniverse fixes it
     logging.getLogger().setLevel(logging.WARNING)
-
-    # Additional import for windows
-    if os.name == "nt":
-        lazy.isaacsim.core.utils.extensions.enable_extension("omni.kit.window.viewport")
 
     # Default Livestream settings
     if gm.REMOTE_STREAMING:
@@ -343,7 +410,7 @@ def _launch_simulator(*args, **kwargs):
     if not og.app:
         og.app = _launch_app()
 
-    class Simulator(lazy.isaacsim.core.api.SimulationContext, Serializable):
+    class Simulator(Serializable):
         """
         Simulator class for directly interfacing with the physx physics engine.
 
@@ -399,15 +466,33 @@ def _launch_simulator(*args, **kwargs):
             self._viewer_camera = None
             self._camera_mover = None
             self._render_on_step = True
-            self.currently_stepping = False
+            self.currently_stepping = (
+                False  # Whether we are currently in a physics step lifecycle, including pre-and-post-step callbacks.
+            )
+            self.currently_in_isaac_step = False  # Whether we are currently in the Isaac Sim-owned part of the step context (e.g. NOT the callbacks)
+            self.pre_step_exception = None
+            self.post_step_exception = None
+
+            self._step_profiler = Profiler(deep=gm.ENABLE_DEEP_PROFILING)
+            self._pre_physics_step_profiler = Profiler(deep=gm.ENABLE_DEEP_PROFILING)
+            self._post_physics_step_profiler = Profiler(deep=gm.ENABLE_DEEP_PROFILING)
+            self._non_physics_step_profiler = Profiler(deep=gm.ENABLE_DEEP_PROFILING)
 
             self._floor_plane = None
             self._skybox = None
             self._last_scene_edge = None
             self._stage_id = None
 
-            # Run super init
-            super().__init__(
+            # USD edit guard: detects edits outside editing_usd() context
+            self._editing_usd = False
+            self._editing_usd_caller = None
+            self._in_sim_lifecycle = 0
+            self._deferred_usd_guard_error = None
+            self._usd_guard_enabled = False
+            self._usd_guard_listener = None
+
+            # Create the SimulationContext instance (composition instead of inheritance)
+            self._sim_context = lazy.isaacsim.core.api.SimulationContext(
                 physics_dt=physics_dt,
                 rendering_dt=rendering_dt,
                 backend="torch",
@@ -416,13 +501,6 @@ def _launch_simulator(*args, **kwargs):
 
             # Store other references to variables that will be initialized later
             self._scenes = []
-            self._physx_interface = lazy.omni.physx.get_physx_interface()
-            self._physx_simulation_interface = lazy.omni.physx.get_physx_simulation_interface()
-            self._physx_scene_query_interface = lazy.omni.physx.get_physx_scene_query_interface()
-            self._physx_fabric_interface = None
-            self._contact_callback = self._physics_context._physx_sim_interface.subscribe_contact_report_events(
-                self._on_contact
-            )
             # The callback will be called right *before* the physics step
             self._pre_physics_step_callback = self._physics_context._physx_interface.subscribe_physics_on_step_events(
                 lambda _: self._on_pre_physics_step(),
@@ -436,15 +514,19 @@ def _launch_simulator(*args, **kwargs):
                 order=0,
             )
             self._simulation_event_callback = (
-                self._physx_interface.get_simulation_event_stream_v2().create_subscription_to_pop(
+                self._physics_context._physx_interface.get_simulation_event_stream_v2().create_subscription_to_pop(
                     self._on_simulation_event
                 )
             )
 
             # List of objects that need to be initialized during whenever the next sim step occurs
             self._objects_to_initialize = []
-            self._objects_require_contact_callback = False
             self._objects_require_joint_break_callback = False
+            self._deferred_joint_breaks = []
+            # Set when update_handles() is called mid-step (currently_stepping): the tensorized
+            # object-state views read world poses from Fabric in their initialize_view(), which is
+            # forbidden during a physics step, so the rebuild is deferred to _on_post_physics_step.
+            self._deferred_tensorized_view_init = False
 
             # Maps callback name to callback
             self._callbacks_on_play = dict()
@@ -461,33 +543,37 @@ def _launch_simulator(*args, **kwargs):
             # Set the lighting mode to be stage by default
             self.set_lighting_mode(mode=LightingMode.STAGE)
 
-            # Mapping from link IDs assigned from omni to the object that they reference
-            self._link_id_to_objects = dict()
-
             # Set of categories that can be grasped by assisted grasping
             self.object_state_types = get_states_by_dependency_order()
             self.object_state_types_requiring_update = [
                 state
                 for state in self.object_state_types
-                if (issubclass(state, UpdateStateMixin) or issubclass(state, GlobalUpdateStateMixin))
+                if (issubclass(state, UpdateStateMixin) or issubclass(state, TensorizedState))
             ]
-            self.object_state_types_on_contact = {
-                state for state in self.object_state_types if issubclass(state, ContactSubscribedStateMixin)
-            }
             self.object_state_types_on_joint_break = {
                 state for state in self.object_state_types if issubclass(state, JointBreakSubscribedStateMixin)
             }
 
-            # Create world prim
-            self.stage.DefinePrim("/World", "Xform")
+            # Create the Fabric Hierarchy
+            self.usdrt_stage = lazy.isaacsim.core.utils.stage.get_current_stage(fabric=True)
+            self.fabric_hierarchy = lazy.usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
+                self.usdrt_stage.GetFabricId(), self.usdrt_stage.GetStageIdAsStageId()
+            )
+
+            # Create world prim and set up initial USD state
+            with self.editing_usd():
+                self.stage.DefinePrim("/World", "Xform")
 
             # Cycle play / stop to validate sim.psi object to avoid getPhysXSceneStatistics errors
             self.play()
             self.stop()
 
             for state in self.object_state_types_requiring_update:
-                if issubclass(state, GlobalUpdateStateMixin):
+                if issubclass(state, TensorizedState):
                     state.global_initialize()
+
+            # Captured wp.Graph wrapping every TensorizedState's global_update().
+            self._state_graph = None
 
             # Now start rebuilding everything
             # Disable collision between root links of fixed base objects
@@ -501,18 +587,25 @@ def _launch_simulator(*args, **kwargs):
 
             # Set the viewer camera, and then set its default pose
             if gm.RENDER_VIEWER_CAMERA:
-                self._set_viewer_camera()
+                self._set_viewer_camera(
+                    viewer_width=viewer_width,
+                    viewer_height=viewer_height,
+                )
                 self.viewer_camera.set_position_orientation(
                     position=th.tensor(m.DEFAULT_VIEWER_CAMERA_POS),
                     orientation=th.tensor(m.DEFAULT_VIEWER_CAMERA_QUAT),
                 )
-                self.viewer_width = viewer_width
-                self.viewer_height = viewer_height
 
-            # Acquire contact sensor interface
-            self._contact_sensor = lazy.isaacsim.sensors.physics._sensor.acquire_contact_sensor_interface()
+            # Enable the USD edit guard - from now on, any USD edits outside editing_usd() will crash
+            self._enable_usd_guard()
 
-        def _set_viewer_camera(self, relative_prim_path="/viewer_camera", viewport_name="Viewport"):
+        def _set_viewer_camera(
+            self,
+            relative_prim_path="/viewer_camera",
+            viewport_name="Viewport",
+            viewer_height=gm.DEFAULT_VIEWER_HEIGHT,
+            viewer_width=gm.DEFAULT_VIEWER_WIDTH,
+        ):
             """
             Creates a camera prim dedicated for this viewer at @prim_path if it doesn't exist,
             and sets this camera as the active camera for the viewer
@@ -526,8 +619,8 @@ def _launch_simulator(*args, **kwargs):
                 relative_prim_path=relative_prim_path,
                 name=relative_prim_path.split("/")[-1],  # Assume name is the lowest-level name in the prim_path
                 modalities="rgb",
-                image_height=self.viewer_height,
-                image_width=self.viewer_width,
+                image_height=viewer_height,
+                image_width=viewer_width,
                 viewport_name=viewport_name,
             )
             self._viewer_camera.load(None)
@@ -554,7 +647,7 @@ def _launch_simulator(*args, **kwargs):
             # default collide with each other, and modify settings for speed optimization
             self._physics_context.set_invert_collision_group_filter(False)
             self._physics_context.enable_ccd(gm.ENABLE_CCD)
-            self._physics_context.enable_fabric(gm.ENABLE_FLATCACHE)
+            self._physics_context.enable_fabric(True)
 
             # Enable GPU dynamics based on whether we need omni particles feature
             if gm.USE_GPU_DYNAMICS:
@@ -573,29 +666,63 @@ def _launch_simulator(*args, **kwargs):
             self._physics_context.set_gpu_max_rigid_patch_count(gm.GPU_MAX_RIGID_PATCH_COUNT)
 
         def _set_renderer_settings(self):
-            lazy.carb.settings.get_settings().set_bool("/rtx/reflections/enabled", True)
-            lazy.carb.settings.get_settings().set_bool("/rtx/indirectDiffuse/enabled", True)
-            lazy.carb.settings.get_settings().set_int("/rtx/post/dlss/execMode", 0)  # "Performance"
-            lazy.carb.settings.get_settings().set_bool("/rtx/ambientOcclusion/enabled", True)
-            lazy.carb.settings.get_settings().set_bool("/rtx/directLighting/sampledLighting/enabled", True)
-            lazy.carb.settings.get_settings().set_int("/rtx/raytracing/showLights", 1)
-            lazy.carb.settings.get_settings().set_float("/rtx/sceneDb/ambientLightIntensity", 1.0)
-            lazy.carb.settings.get_settings().set_bool("/app/renderer/skipMaterialLoading", False)
-            lazy.carb.settings.get_settings().set_bool("/rtx/flow/enabled", True)
+            settings = lazy.carb.settings.get_settings()
+            settings.set_bool("/rtx/rtx/modes/rt/enabled", True)  # real-time 2.0 requires rt to be enabled as well
+            settings.set_bool("/rtx/rtx/modes/rt2/enabled", True)
+            settings.set("/rtx/rendermode", "RealTimePathTracing")
+            settings.set_bool("/rtx/raytracing/fractionalCutoutOpacity", True)
+
+            settings.set_bool("/rtx/reflections/enabled", True)
+            settings.set_bool("/rtx/indirectDiffuse/enabled", True)
+            settings.set_int(
+                "/rtx/post/dlss/execMode", 0 if not gm.ENABLE_HQ_RENDERING else 1
+            )  # "Performance" vs "Realism"
+            settings.set_bool("/rtx/ambientOcclusion/enabled", True)
+            settings.set_bool("/rtx/directLighting/sampledLighting/enabled", True)
+            settings.set_int("/rtx/raytracing/showLights", 1)
+            settings.set_float("/rtx/sceneDb/ambientLightIntensity", 1.0)
+            settings.set_bool("/app/renderer/skipMaterialLoading", False)
+            settings.set_bool("/rtx/flow/enabled", True)
 
             # Below settings are for improving performance: we use the USD / Fabric only for poses.
-            lazy.carb.settings.get_settings().set_bool("/physics/updateToUsd", not gm.ENABLE_FLATCACHE)
-            lazy.carb.settings.get_settings().set_bool("/physics/updateParticlesToUsd", True)
-            lazy.carb.settings.get_settings().set_bool("/physics/updateVelocitiesToUsd", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/updateForceSensorsToUsd", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/updateResidualsToUsd", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/outputVelocitiesLocalSpace", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/fabricUpdateTransformations", True)
-            lazy.carb.settings.get_settings().set_bool("/physics/fabricUpdateVelocities", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/fabricUpdateForceSensors", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/fabricUpdateJointStates", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/fabricUpdateResiduals", False)
-            lazy.carb.settings.get_settings().set_bool("/physics/fabricUseGPUInterop", True)
+            settings.set_bool("/physics/updateToUsd", False)
+            settings.set_bool("/physics/updateParticlesToUsd", True)
+            settings.set_bool(
+                "/physics/updateVelocitiesToUsd", gm.ENABLE_HQ_RENDERING
+            )  # Needed for isosurface HQ rendering
+            settings.set_bool("/physics/updateForceSensorsToUsd", False)
+            settings.set_bool("/physics/updateResidualsToUsd", False)
+            settings.set_bool("/physics/outputVelocitiesLocalSpace", False)
+            settings.set_bool("/physics/fabricUpdateTransformations", True)
+            settings.set_bool("/physics/fabricUpdateVelocities", False)
+            settings.set_bool("/physics/fabricUpdateForceSensors", False)
+            settings.set_bool("/physics/fabricUpdateJointStates", False)
+            settings.set_bool("/physics/fabricUpdateResiduals", False)
+            settings.set_bool("/physics/fabricUseGPUInterop", True)
+
+            if gm.ENABLE_HQ_RENDERING:
+                min_frame_rate = 60
+                # Make sure we have at least 60 FPS before setting "persistent/simulation/minFrameRate" to 60
+                assert (1 / self.get_rendering_dt()) >= min_frame_rate, (
+                    f"isosurface HQ rendering requires at least {min_frame_rate} FPS; consider increasing "
+                    f"rendering_frequency of env_config to {min_frame_rate}."
+                )
+
+                # Settings for Isosurface
+                # disable grid and lights
+                dOptions = settings.get_as_int("/persistent/app/viewport/displayOptions")
+                dOptions &= ~(1 << 6 | 1 << 8)
+                settings.set_int("/persistent/app/viewport/displayOptions", dOptions)
+                settings.set_int("/persistent/simulation/minFrameRate", min_frame_rate)
+                settings.set_bool("/rtx-defaults/pathtracing/lightcache/cached/enabled", False)
+                settings.set_bool("/rtx-defaults/pathtracing/cached/enabled", False)
+                settings.set_int("/rtx-defaults/pathtracing/fireflyFilter/maxIntensityPerSample", 10000)
+                settings.set_int("/rtx-defaults/pathtracing/fireflyFilter/maxIntensityPerSampleDiffuse", 50000)
+                settings.set_float("/rtx-defaults/pathtracing/optixDenoiser/blendFactor", 0.09)
+                settings.set_int("/rtx-defaults/pathtracing/aa/op", 2)
+                settings.set_int("/rtx-defaults/pathtracing/maxBounces", 32)
+                settings.set_int("/rtx-defaults/pathtracing/maxSpecularAndTransmissionBounces", 16)
+                settings.set_int("/rtx-defaults/translucency/maxRefractionBounces", 12)
 
         def _validate_dts(self, physics_dt, rendering_dt, sim_step_dt):
             """
@@ -691,19 +818,22 @@ def _launch_simulator(*args, **kwargs):
             """
             if self._floor_plane is not None:
                 return
+
             ground_plane_relative_path = "/ground_plane"
-            plane = lazy.isaacsim.core.api.objects.ground_plane.GroundPlane(
-                prim_path="/World" + ground_plane_relative_path,
-                name="ground_plane",
-                z_position=0,
-                size=None,
-                color=None if floor_plane_color is None else th.tensor(floor_plane_color),
-                visible=floor_plane_visible,
-                # TODO: update with new PhysicsMaterial API
-                # static_friction=static_friction,
-                # dynamic_friction=dynamic_friction,
-                # restitution=restitution,
-            )
+
+            with self.editing_usd():
+                plane = lazy.isaacsim.core.api.objects.ground_plane.GroundPlane(
+                    prim_path="/World" + ground_plane_relative_path,
+                    name="ground_plane",
+                    z_position=0,
+                    size=None,
+                    color=None if floor_plane_color is None else th.tensor(floor_plane_color),
+                    visible=floor_plane_visible,
+                    # TODO: update with new PhysicsMaterial API
+                    # static_friction=static_friction,
+                    # dynamic_friction=dynamic_friction,
+                    # restitution=restitution,
+                )
 
             triangularize_mesh(lazy.pxr.UsdGeom.Mesh.Define(self.stage, plane.prim.GetChildren()[0].GetPath()))
 
@@ -714,11 +844,7 @@ def _launch_simulator(*args, **kwargs):
             self._floor_plane.load(None)
 
             # Assign floors category to the floor plane
-            lazy.isaacsim.core.utils.semantics.add_update_semantics(
-                prim=self._floor_plane.prim,
-                semantic_label="floors",
-                type_label="class",
-            )
+            add_semantic_label(prim=self._floor_plane.prim, label="floors")
 
         def add_skybox(self):
             """
@@ -732,7 +858,6 @@ def _launch_simulator(*args, **kwargs):
                 category="background",
                 light_type="Dome",
                 intensity=2500,
-                fixed_base=True,
             )
             self._skybox.load(None)
             self._skybox.color = (1.07, 0.85, 0.61)
@@ -759,7 +884,8 @@ def _launch_simulator(*args, **kwargs):
                 sim_step_dt (float, optional): Internal simulation step timestep
                     If None, will default to the current value
             """
-            super().set_simulation_dt(physics_dt=physics_dt, rendering_dt=rendering_dt)
+            with self.editing_usd():
+                self._sim_context.set_simulation_dt(physics_dt=physics_dt, rendering_dt=rendering_dt)
             current_physics_dt = self.get_physics_dt()
             current_rendering_dt = self.get_rendering_dt()
 
@@ -790,41 +916,44 @@ def _launch_simulator(*args, **kwargs):
             self._camera_mover.print_info()
             return self._camera_mover
 
-        def import_scene(self, scene):
+        def import_scene(self, scenes):
             """
-            Import a scene into the simulator. A scene could be a synthetic one or a realistic Gibson Environment.
+            Import one or more scenes into the simulator. A scene could be a synthetic one or a realistic Gibson
+            Environment.
 
             Args:
-                scene (Scene): a scene object to load
+                scenes (Scene or list of Scenes): scene(s) to load
             """
             assert self.is_stopped(), "Simulator must be stopped while importing a scene!"
-            assert isinstance(scene, Scene), "import_scene can only be called with Scene"
+            if isinstance(scenes, Scene):
+                scenes = [scenes]
+            assert all(
+                isinstance(scene, Scene) for scene in scenes
+            ), "import_scene can only be called with Scene instances"
+            assert len(scenes) > 0, "import_scene requires at least one scene"
 
             # Check that the scene is not already imported
-            if scene.loaded:
-                raise ValueError("Scene is already loaded!")
+            for scene in scenes:
+                if scene.loaded:
+                    raise ValueError("Scene is already loaded!")
+                self._last_scene_edge = scene.load(
+                    idx=len(self.scenes),
+                    last_scene_edge=self._last_scene_edge,
+                    initial_scene_prim_z_offset=m.INITIAL_SCENE_PRIM_Z_OFFSET,
+                    scene_margin=m.SCENE_MARGIN,
+                )
+                # Load the scene.
+                self._scenes.append(scene)
 
-            self._last_scene_edge = scene.load(
-                idx=len(self.scenes),
-                last_scene_edge=self._last_scene_edge,
-                initial_scene_prim_z_offset=m.INITIAL_SCENE_PRIM_Z_OFFSET,
-                scene_margin=m.SCENE_MARGIN,
-            )
-
-            # Load the scene.
-            self._scenes.append(scene)
-
-            # Make sure simulator is not running, then start it so that we can initialize the scene
-            assert self.is_stopped(), "Simulator must be stopped after importing a scene!"
             self.play()
-
-            # Initialize the scene
-            scene.initialize()
-
-            # Need to one more step for particle systems to work
+            for scene in scenes:
+                scene.initialize()
+            # One step is needed for particle systems to work.
             self.step()
             self.stop()
-            log.info(f"Imported scene {scene.idx}.")
+
+            for scene in scenes:
+                log.info(f"Imported scene {scene.idx}.")
 
         # TODO: Remove this context manager and call _post_import_object directly since the objects
         # are already known when this is called.
@@ -836,7 +965,7 @@ def _launch_simulator(*args, **kwargs):
             the simulator; it is assumed that this is handled externally
 
             Args:
-                objs (Iterable[BaseObject]): list of objects to add
+                objs (Iterable[USDObject]): list of objects to add
             """
             SimulationManager = lazy.isaacsim.core.simulation_manager.SimulationManager
             if self.is_playing() and SimulationManager._physics_sim_view:
@@ -846,38 +975,30 @@ def _launch_simulator(*args, **kwargs):
                 SimulationManager._physics_sim_view.invalidate()
                 SimulationManager._physics_sim_view = None
 
-            yield
+            try:
+                yield
+            finally:
+                # We want to make sure we revalidate the views here even if the object addition
+                # fails, because the pre-yield invalidation above leaves things in a broken state.
+                if self.is_playing():
+                    self.update_handles()
 
             # Run all post-processing on all newly added objects
             for obj in objs:
                 self._post_import_object(obj=obj)
-
-            if self.is_playing():
-                # The objects have been added to the USD stage but PhysX hasn't been synchronized yet.
-                # We must flush USD changes to PhysX before updating handles to avoid errors like
-                # "Provided pattern list did not match any rigid bodies".
-                # The order of operations should strictly be:
-                #   1. Flush USD changes to PhysX
-                #   2. Update handles to reinitialize physics view
-                SimulationManager._physx_sim_interface.flush_changes()
-                self.update_handles()
 
         def _post_import_object(self, obj):
             """
             Post import an object into the simulator, handling any additional setup that needs to be done.
 
             Args:
-                obj (BaseObject): an object to load
+                obj (USDObject): an object to load
             """
-            assert isinstance(obj, BaseObject), "_post_import_object can only be called with BaseObject"
+            assert isinstance(obj, USDObject), "_post_import_object can only be called with USDObject"
 
             # Run any callbacks
             for callback in self._callbacks_on_add_obj.values():
                 callback(obj)
-
-            # Cache the mapping from link IDs to object
-            for link in obj.links.values():
-                self._link_id_to_objects[lazy.pxr.PhysicsSchemaTools.sdfPathToInt(link.prim_path)] = obj
 
             # Lastly, additionally add this object automatically to be initialized as soon as another simulator step occurs
             self._objects_to_initialize.append(obj)
@@ -887,7 +1008,7 @@ def _launch_simulator(*args, **kwargs):
             Add a set of objects from the simulator.
 
             Args:
-                objs (Iterable[BaseObject]): list of objects to add
+                objs (Iterable[USDObject]): list of objects to add
                 scenes (Iterable[BaseScene]): list of scenes corresponding to each object to load
             """
             with self.adding_objects(objs=objs):
@@ -902,7 +1023,7 @@ def _launch_simulator(*args, **kwargs):
             the simulator; it is assumed that this is handled externally
 
             Args:
-                objs (Iterable[BaseObject]): list of objects to remove
+                objs (Iterable[USDObject]): list of objects to remove
             """
             playing = self.is_playing()
             if playing:
@@ -931,15 +1052,30 @@ def _launch_simulator(*args, **kwargs):
                         obj.name in obj_registry
                     ):  # a particle system template object might not exist in the registry when it's empty
                         obj_registry.pop(obj.name)
+                    # Remove stale articulated-grasp constraints for any robot arm targeting this object.
+                    for robot in obj.scene.robots:
+                        robot_state = obj_registry.get(robot.name)
+                        ag_params = None if robot_state is None else robot_state.get("ag_obj_constraint_params")
+                        if ag_params is None:
+                            continue
+                        for arm, arm_params in ag_params.items():
+                            if not arm_params:
+                                continue
+                            target_obj = arm_params.get("target_obj")
+                            target_obj_name = target_obj.name if hasattr(target_obj, "name") else target_obj
+                            if target_obj_name == obj.name or arm_params.get("ag_obj_prim_path") == obj.prim_path:
+                                ag_params[arm] = None
 
             # Run the main method
-            yield
+            try:
+                yield
+            finally:
+                # Update all handles that are now broken because objects have changed
+                if playing:
+                    self.update_handles()
 
             # Run post-processing required if we were playing
             if playing:
-                # Update all handles that are now broken because objects have changed
-                self.update_handles()
-
                 if gm.ENABLE_TRANSITION_RULES:
                     # Prune the transition rules that are currently active
                     for scene in scenes_modified:
@@ -953,15 +1089,11 @@ def _launch_simulator(*args, **kwargs):
             Remove a non-robot object from the simulator. Should not be called directly by the user.
 
             Args:
-                obj (BaseObject): a non-robot object to remove
+                obj (USDObject): a non-robot object to remove
             """
             # Run any callbacks
             for callback in self._callbacks_on_remove_obj.values():
                 callback(obj)
-
-            # pop all link ids
-            for link in obj.links.values():
-                self._link_id_to_objects.pop(lazy.pxr.PhysicsSchemaTools.sdfPathToInt(link.prim_path))
 
             # If it was queued up to be initialized, remove it from the queue as well
             for i, initialize_obj in enumerate(self._objects_to_initialize):
@@ -974,11 +1106,13 @@ def _launch_simulator(*args, **kwargs):
             Remove a set of objects from the simulator.
 
             Args:
-                objs (Iterable[BaseObject]): list of objects to remove
+                objs (Iterable[USDObject]): list of objects to remove
             """
-            with self.removing_objects(objs=objs):
-                for obj in objs:
-                    obj.scene.remove_object(obj, _batched_call=True)
+            objs = list(objs)
+            if len(objs) > 0:
+                with self.removing_objects(objs=objs):
+                    for obj in objs:
+                        obj.scene.remove_object(obj, _batched_call=True)
 
         def remove_prim(self, prim):
             """
@@ -996,31 +1130,106 @@ def _launch_simulator(*args, **kwargs):
             # Update all handles that are now broken because prims have changed
             self.update_handles()
 
-        def _reset_variables(self):
-            """
-            Reset internal variables when a new stage is loaded
-            """
+        # ---- Proxy properties/methods delegating to the SimulationContext instance ----
+        def get_physics_context(self):
+            return self._sim_context.get_physics_context()
+
+        @property
+        def _physics_context(self):
+            return self._sim_context._physics_context
+
+        @property
+        def stage(self):
+            return self._sim_context.stage
+
+        @property
+        def current_time(self):
+            return self._sim_context.current_time
+
+        @property
+        def _initial_physics_dt(self):
+            return self._sim_context._initial_physics_dt
+
+        @property
+        def _initial_rendering_dt(self):
+            return self._sim_context._initial_rendering_dt
+
+        def is_playing(self):
+            return self._sim_context.is_playing()
+
+        def is_stopped(self):
+            return self._sim_context.is_stopped()
+
+        def get_physics_dt(self):
+            return self._sim_context.get_physics_dt()
+
+        def get_rendering_dt(self):
+            return self._sim_context.get_rendering_dt()
+
+        @property
+        def physics_sim_view(self):
+            return self._sim_context.physics_sim_view
+
+        @property
+        def pi(self):
+            return self._physics_context._physx_interface
+
+        @property
+        def psi(self):
+            return self._physics_context._physx_sim_interface
+
+        @property
+        def psqi(self):
+            return lazy.omni.physx.get_physx_scene_query_interface()
+
+        @property
+        def current_time_step_index(self):
+            return self._sim_context.current_time_step_index
+
+        # ---- End proxy properties/methods ----
 
         def render(self):
-            super().render()
-            # During rendering, the Fabric API is updated, so we can mark it as clean
-            PoseAPI.mark_valid()
+            self._check_usd_guard()
+            self._in_sim_lifecycle += 1
+            try:
+                self._sim_context.render()
+            finally:
+                self._in_sim_lifecycle -= 1
 
         def _refresh_physics_sim_view(self):
-            SimulationManager = lazy.isaacsim.core.simulation_manager.SimulationManager
-            IsaacEvents = lazy.isaacsim.core.simulation_manager.IsaacEvents
+            self._in_sim_lifecycle += 1
+            try:
+                SimulationManager = lazy.isaacsim.core.simulation_manager.SimulationManager
+                IsaacEvents = lazy.isaacsim.core.simulation_manager.IsaacEvents
 
-            SimulationManager._physics_sim_view = lazy.omni.physics.tensors.create_simulation_view(
-                SimulationManager._backend
-            )
-            SimulationManager._physics_sim_view.set_subspace_roots("/")
-            SimulationManager._message_bus.dispatch(IsaacEvents.SIMULATION_VIEW_CREATED.value, payload={})
-            SimulationManager._message_bus.dispatch(IsaacEvents.PHYSICS_READY.value, payload={})
+                stage_id = lazy.isaacsim.core.utils.stage.get_current_stage_id()
+                SimulationManager._physics_sim_view = lazy.omni.physics.tensors.create_simulation_view(
+                    SimulationManager._backend, stage_id=stage_id
+                )
+                SimulationManager._physics_sim_view.set_subspace_roots("/")
+                SimulationManager._physics_sim_view__warp = lazy.omni.physics.tensors.create_simulation_view(
+                    "warp", stage_id=stage_id
+                )
+                SimulationManager._simulation_view_created = True
+                SimulationManager._message_bus.dispatch_event(IsaacEvents.SIMULATION_VIEW_CREATED.value, payload={})
+                SimulationManager._message_bus.dispatch_event(IsaacEvents.PHYSICS_READY.value, payload={})
+            finally:
+                self._in_sim_lifecycle -= 1
+
+        def sync_physx_to_fabric(self):
+            # We don't want to sync PhysX to Fabric during a physics step, as it is quite slow!
+            assert not self.currently_stepping, "Cannot refresh poses during a physics step!"
+
+            self._sim_context._physx_fabric_interface.update(self.current_time, self.get_physics_dt())
 
         def update_handles(self):
             # Handles are only relevant when physx is running
             if not self.is_playing():
                 return
+
+            # Flush any USD changes to PhysX
+            with self.editing_usd():
+                self.psi.flush_changes()
 
             # Refresh the sim view
             self._refresh_physics_sim_view()
@@ -1034,13 +1243,130 @@ def _launch_simulator(*args, **kwargs):
                             obj.update_handles()
                     for system in scene.active_systems.values():
                         if isinstance(system, MacroPhysicalParticleSystem):
-                            system.refresh_particles_view()
+                            system.update_handles()
 
             # Finally update any unified views
             RigidContactAPI.initialize_view()
-            GripperRigidContactAPI.initialize_view()
+            RigidBodyViewAPI.initialize_view()
+            ArticulatedObjectViewAPI.initialize_view()
             ControllableObjectViewAPI.initialize_view()
 
+            if gm.ENABLE_OBJECT_STATES:
+                if self.currently_stepping:
+                    # update_handles() is reached mid-step when a joint is created during a physics
+                    # callback (e.g. assisted grasping or on-contact attachment). Tensorized state
+                    # views bake static geometry from Fabric world poses in initialize_view(), which
+                    # is forbidden while currently_stepping=True. These views are only consumed by the
+                    # post-physics state update, so defer the rebuild until currently_stepping clears
+                    # (mirrors the deferred joint-break handling in _on_post_physics_step). The physics
+                    # views above are refreshed immediately so the new joint is registered.
+                    self._deferred_tensorized_view_init = True
+                else:
+                    for state_type in og.sim.object_state_types_requiring_update:
+                        if issubclass(state_type, TensorizedState):
+                            state_type.initialize_view()
+
+        def _refresh_state_caches(self, dt=0.0):
+            """
+            Run a full update for tensorized object state and view API.
+
+            This function will be called in the following cases:
+            - in usual step, in ``_non_physics_step`` (passes the sim-step dt)
+            - in ``step_physics`` (passes dt=0)
+            - anywhere that poses/joints are set between sim steps (sample_kinematics,
+            Inside._set_value, set_position_orientation / JointPrim.set_pos) and
+            any TensorizedAbsoluteState need to get_value (default dt=0)
+
+            ``dt`` is the seconds elapsed for this logical step; it is forwarded to each
+            tensorized state's ``pre_update`` so time-dependent states advance by exactly the
+            sim-step dt on a real step and by 0 on physics-only / out-of-step refreshes.
+
+            Always clears ``TensorizedState.caches_dirty`` on completion.
+            """
+            if len(self.scenes) == 0 or not self.is_playing():
+                TensorizedState.caches_dirty = False
+                return
+
+            RigidBodyViewAPI.read_from_physx()
+            ArticulatedObjectViewAPI.read_from_physx()
+            wp.synchronize_stream(wp.get_stream())
+
+            self._capture_warp_graph(dt)
+
+            RigidContactAPI._PENDING_STEPS = 0
+
+        def _capture_warp_graph(self, dt=0.0):
+            """
+            Manage the per-step warp graph end-to-end (gating, pre/post bookkeeping, capture,
+            and launch all live here so ``_refresh_state_caches`` stays thin).
+
+            Steps:
+              1. Compute the list of tensorized states, gated on ``gm.ENABLE_OBJECT_STATES``.
+                 If the list is empty (object states disabled or none registered), run the
+                 view-API ``update()``s directly and return — there is no pre/global/post
+                 pipeline to drive.
+              2. Otherwise, run ``pre_update(dt)`` for each state, then either (re-)capture or
+                 replay the per-step graph (view-API H2D + tensorized state global_updates).
+                 ``wp.ScopedCapture`` only RECORDS ops — the captured graph must be launched
+                 explicitly via ``wp.capture_launch`` for its kernels to run this frame.
+              3. After ``wp.synchronize()``, run ``post_update`` for each state for change
+                 detection.
+
+            Always clears ``TensorizedState.caches_dirty`` on completion.
+            """
+            tensorized_states = (
+                [state for state in self.object_state_types_requiring_update if issubclass(state, TensorizedState)]
+                if gm.ENABLE_OBJECT_STATES
+                else []
+            )
+
+            if not tensorized_states:
+                # No tensorized-state pipeline → still refresh GPU view-API mirrors so
+                # downstream consumers (rendering, ad-hoc queries) see fresh poses / contacts.
+                RigidBodyViewAPI.update()
+                RigidContactAPI.update()
+                wp.synchronize_stream(wp.get_stream())
+                TensorizedState.caches_dirty = False
+                return
+
+            # Nested _get_value during this refresh should read the cache directly rather
+            # than recursively triggering another refresh.
+            TensorizedState._refresh_in_progress = True
+            try:
+                TensorizedState.caches_dirty = True
+
+                for state_type in tensorized_states:
+                    state_type.pre_update(dt)
+
+                if TensorizedState.graph_dirty:
+                    if all(s.VALUES is None or s.VALUES.numel() == 0 for s in tensorized_states):
+                        # Nothing to capture; leave _state_graph as None.
+                        self._state_graph = None
+                    else:
+                        # ScopedCapture creates + owns its capture stream. Inside the with-block,
+                        # wp.get_stream() returns that stream and any wp.launch / wp.copy defaults
+                        # to it. Tensorized-state kernels read POSE_MATRICES / joint positions
+                        # written by the view-API kernels above — stream ordering on the capture
+                        # stream guarantees they see fresh values.
+                        with wp.ScopedCapture(device="cuda") as capture:
+                            RigidBodyViewAPI.update()
+                            RigidContactAPI.update()
+                            for state_type in tensorized_states:
+                                state_type.global_update()
+                        self._state_graph = capture.graph
+                    TensorizedState.graph_dirty = False
+                if self._state_graph is not None:
+                    wp.capture_launch(self._state_graph)
+
+                wp.synchronize_stream(wp.get_stream())
+
+                for state_type in tensorized_states:
+                    state_type.post_update()
+            finally:
+                TensorizedState._refresh_in_progress = False
+                TensorizedState.caches_dirty = False
+
+        @with_profiler(name="_non_physics_step_profiler")
         def _non_physics_step(self):
             """
             Complete any non-physics steps such as state updates.
@@ -1059,14 +1385,11 @@ def _launch_simulator(*args, **kwargs):
                     # may be added mid-iteration!!
                     # For this same reason, after we finish the loop, we keep any objects that are yet to be initialized
                     # First call zero-physics step update, so that handles are properly propagated
-                    og.sim.pi.update_simulation(elapsedStep=0, currentTime=og.sim.current_time)
                     scenes_modified = set()
                     for i in range(n_objects_to_initialize):
                         obj = self._objects_to_initialize[i]
                         obj.initialize()
                         scenes_modified.add(obj.scene)
-                        if len(obj.states.keys() & self.object_state_types_on_contact) > 0:
-                            self._objects_require_contact_callback = True
                         if len(obj.states.keys() & self.object_state_types_on_joint_break) > 0:
                             self._objects_require_joint_break_callback = True
                         obj.keep_still()
@@ -1086,12 +1409,15 @@ def _launch_simulator(*args, **kwargs):
                     for system in scene.active_systems.values():
                         system.update()
 
+                # Update view API data and tensorized states. One _non_physics_step runs per
+                # og.sim.step(), which spans get_sim_step_dt() seconds — advance time-dependent
+                # states by exactly that.
+                self._refresh_state_caches(dt=self.get_sim_step_dt())
+
                 # Propagate states if the feature is enabled
                 if gm.ENABLE_OBJECT_STATES:
-                    # Step the object states in global topological order (if the scene exists)
+                    # UpdateStateMixin per-object updates (reads VALUES_CPU after sync)
                     for state_type in self.object_state_types_requiring_update:
-                        if issubclass(state_type, GlobalUpdateStateMixin):
-                            state_type.global_update()
                         if issubclass(state_type, UpdateStateMixin):
                             for scene in self.scenes:
                                 for obj in scene.get_objects_with_state(state_type):
@@ -1100,23 +1426,32 @@ def _launch_simulator(*args, **kwargs):
                                     # is playing
                                     obj.states[state_type].update()
 
-                    for scene in self.scenes:
-                        for obj in scene.objects:
-                            # Only update visuals for objects that have been initialized so far
-                            if isinstance(obj, StatefulObject) and obj.initialized:
-                                obj.update_visuals()
+                    # Skip visual updates when rendering is disabled (pure-physics steps).
+                    if self._render_on_step:
+                        for scene in self.scenes:
+                            for obj in scene.objects:
+                                # Only update visuals for objects that have been initialized so far
+                                if obj.initialized:
+                                    obj.update_visuals()
 
                 # Possibly run transition rule step
                 if gm.ENABLE_TRANSITION_RULES:
-                    for scene in self.scenes:
-                        scene.transition_rule_api.step()
+                    transitions = [
+                        (scene.transition_rule_api, scene.transition_rule_api.get_transition_results())
+                        for scene in self.scenes
+                    ]
+                    # Remove across all scenes before adding objects, whose initialization is deferred.
+                    removed_objs = [obj for _, result in transitions for obj in result.remove]
+                    if removed_objs:
+                        self.batch_remove_objects(removed_objs)
+                    for api, result in transitions:
+                        api.execute_transition(added_obj_attrs=result.add, removed_objs=[])
 
         def play(self):
             if not self.is_playing():
                 # Track whether we're starting the simulator fresh -- i.e.: whether we were stopped previously
                 was_stopped = self.is_stopped()
 
-                # Run super first
                 # We suppress warnings from omni.usd because it complains about values set in the native USD
                 # These warnings occur because the native USD file has some type mismatch in the `scale` property,
                 # where the property expects a double but for whatever reason the USD interprets its values as floats
@@ -1126,11 +1461,14 @@ def _launch_simulator(*args, **kwargs):
                 #   ignore this if the scale is close to uniform.
                 # We also need to suppress the following error when flat cache is used:
                 # [omni.physx.plugin] Transformation change on non-root links is not supported.
-                channels = ["omni.usd", "omni.physicsschema.plugin"]
-                if gm.ENABLE_FLATCACHE:
-                    channels.append("omni.physx.plugin")
+                channels = ["omni.usd", "omni.physicsschema.plugin", "omni.physx.plugin"]
+
                 with suppress_omni_log(channels=channels):
-                    super().play()
+                    self._in_sim_lifecycle += 1
+                    try:
+                        self._sim_context.play()
+                    finally:
+                        self._in_sim_lifecycle -= 1
 
                 # Take a render step -- this is needed so that certain (unknown, maybe omni internal state?) is populated
                 # correctly.
@@ -1142,20 +1480,11 @@ def _launch_simulator(*args, **kwargs):
 
                 if was_stopped:
                     # We need to update controller mode because kp and kd were set to the original (incorrect) values when
-                    # sim was stopped. We need to reset them to default_kp and default_kd defined in ControllableObject.
-                    # We also need to take an additional sim step to make sure simulator is functioning properly.
-                    # We need to do this because for some reason omniverse exhibits strange behavior if we do certain
-                    # operations immediately after playing; e.g.: syncing USD poses when flatcache is enabled
+                    # sim was stopped. We need to reset them to default_kp and default_kd defined defined in Robot.
                     for scene in self.scenes:
                         for robot in scene.robots:
                             if robot.initialized:
                                 robot.update_controller_mode()
-                                # TODO: Typically, robots should be initialized on the first play() call
-                                # Problem: In multi-environment setups, import_scene() for subsequent environments
-                                # calls play()+stop(), which prematurely triggers initialization before all environments
-                                # are loaded. This is a temporary workaround.
-                                robot.reset()
-                                robot.keep_still()
 
                         # Also refresh any transition rules that became stale while sim was stopped
                         if gm.ENABLE_TRANSITION_RULES:
@@ -1170,11 +1499,15 @@ def _launch_simulator(*args, **kwargs):
 
         def pause(self):
             if not self.is_paused():
-                super().pause()
+                self._sim_context.pause()
 
         def stop(self):
             if not self.is_stopped():
-                super().stop()
+                self._in_sim_lifecycle += 1
+                try:
+                    self._sim_context.stop()
+                finally:
+                    self._in_sim_lifecycle -= 1
 
             # Run all callbacks
             for callback in self._callbacks_on_stop.values():
@@ -1192,10 +1525,14 @@ def _launch_simulator(*args, **kwargs):
             assert n_physics_timesteps_per_render.is_integer(), "render_timestep must be a multiple of physics_timestep"
             return int(n_physics_timesteps_per_render)
 
+        @with_profiler(name="_step_profiler")
         def step(self):
             """
             Step the simulation at self.get_sim_step_dt() rate
             """
+            self._check_usd_guard()
+            assert self.is_playing(), "Simulator must be playing to step"
+
             render = self._render_on_step
             if self.stage is None:
                 raise Exception("There is no stage currently opened, init_stage needed before calling this func")
@@ -1209,90 +1546,135 @@ def _launch_simulator(*args, **kwargs):
             for scene in self.scenes:
                 scene.clear_updated_objects()
 
-            for _ in range(self._n_steps_per_loop):
-                if render:
-                    super().step(render=True)
-                else:
-                    for i in range(self.n_physics_timesteps_per_render):
-                        super().step(render=False)
+            self._in_sim_lifecycle += 1
+            try:
+                for _ in range(self._n_steps_per_loop):
+                    if render:
+                        self._sim_context.step(render=True)
+                        self._report_step_exceptions()
+                    else:
+                        for i in range(self.n_physics_timesteps_per_render):
+                            self._sim_context.step(render=False)
+                            self._report_step_exceptions()
+            finally:
+                self._in_sim_lifecycle -= 1
 
             # Additionally run non physics things
             self._non_physics_step()
 
-            # TODO (eric): After stage changes (e.g. pose, texture change), it will take two super().step(render=True) for
-            #  the result to propagate to the rendering. We could have called super().render() here but it will introduce
+            # TODO (eric): After stage changes (e.g. pose, texture change), it will take two _sim_context.step(render=True) for
+            #  the result to propagate to the rendering. We could have called _sim_context.render() here but it will introduce
             #  a big performance regression.
 
         def step_physics(self):
             """
             Step the physics a single step.
             """
-            self._physics_context._step(current_time=self.current_time)
+            assert self.is_playing(), "Simulator must be playing to step"
 
+            self._in_sim_lifecycle += 1
+            try:
+                self._physics_context._step(current_time=self.current_time)
+            finally:
+                self._in_sim_lifecycle -= 1
+
+            self._report_step_exceptions()
+
+            # Accumulate contact data from this physics step and then flush to cache.
+            # We normally do this in _non_physics_step, but step_physics bypasses that so we do it here.
+            # dt=0: a bare physics step must not advance time-dependent states (matches legacy behavior).
+            self._refresh_state_caches(dt=0.0)
+
+        @with_profiler(name="_pre_physics_step_profiler")
         def _on_pre_physics_step(self):
-            # Make it possible to identify that we are currently within a step
-            self.currently_stepping = True
+            try:
+                # Make it possible to identify that we are currently within a step
+                self.currently_stepping = True
 
-            # Invalidate various APIs so that any reads from them will be updated
-            PoseAPI.invalidate()
-            RigidContactAPI.clear()
-            GripperRigidContactAPI.clear()
+                # Only do this if we're not in the warmup phase
+                if not lazy.isaacsim.core.simulation_manager.SimulationManager._warmup_needed:
+                    # Batch-step all controller groups (computes control and writes to Isaac buffer)
+                    ControllerView.step_all()
 
-            # Only do this if we're not in the warmup phase
-            if not lazy.isaacsim.core.simulation_manager.SimulationManager._warmup_needed:
-                # Run the controller step on every controllable object
-                for scene in self.scenes:
-                    for obj in scene.objects:
-                        if isinstance(obj, ControllableObject):
-                            obj.step()
+                    # Per-robot post-step: override frozen gripper positions, handle assisted grasping
+                    for scene in self.scenes:
+                        for robot in scene.robots:
+                            robot.post_step()
 
-                # Flush the controls from the ControllableObjectViewAPI
-                ControllableObjectViewAPI.flush_control()
+                    # Flush the controls from the ControllableObjectViewAPI
+                    ControllableObjectViewAPI.flush_control()
 
+                self.currently_in_isaac_step = True
+            except Exception as e:
+                self.currently_stepping = False
+                self.currently_in_isaac_step = False
+                self.pre_step_exception = e
+                raise
+
+        @with_profiler(name="_post_physics_step_profiler")
         def _on_post_physics_step(self):
-            # Only do this if we're not in the warmup phase
-            if not lazy.isaacsim.core.simulation_manager.SimulationManager._warmup_needed:
-                # Run the post physics update for backend view
-                ControllableObjectViewAPI.post_physics_step()
+            try:
+                self.currently_in_isaac_step = False
 
-            # Record that we are done with the step context.
-            self.currently_stepping = False
+                # Only do this if we're not in the warmup phase
+                if not lazy.isaacsim.core.simulation_manager.SimulationManager._warmup_needed:
+                    # Run the post physics update for backend view
+                    ControllableObjectViewAPI.post_physics_step()
 
-        def _on_contact(self, contact_headers, contact_data):
-            """
-            This callback will be invoked after every PHYSICS step if there is any contact.
-            For each of the pair of objects in each contact, we invoke the on_contact function for each of its states
-            that subclass ContactSubscribedStateMixin. These states update based on contact events.
-            """
-            if gm.ENABLE_OBJECT_STATES and self._objects_require_contact_callback:
-                headers = defaultdict(list)
-                for contact_header in contact_headers:
-                    actor0_obj = self._link_id_to_objects.get(contact_header.actor0, None)
-                    actor1_obj = self._link_id_to_objects.get(contact_header.actor1, None)
-                    # If any of the objects cannot be found, skip
-                    if actor0_obj is None or actor1_obj is None:
-                        continue
-                    # If any of the objects is not initialized, skip
-                    if not actor0_obj.initialized or not actor1_obj.initialized:
-                        continue
-                    # If any of the objects is not stateful, skip
-                    if not isinstance(actor0_obj, StatefulObject) or not isinstance(actor1_obj, StatefulObject):
-                        continue
-                    # If any of the objects doesn't have states that require on_contact callbacks, skip
-                    if (
-                        len(actor0_obj.states.keys() & self.object_state_types_on_contact) == 0
-                        or len(actor1_obj.states.keys() & self.object_state_types_on_contact) == 0
-                    ):
-                        continue
-                    headers[tuple(sorted((actor0_obj, actor1_obj), key=lambda x: x.uuid))].append(contact_header)
+                # Pull the contact sensor data — must run while currently_stepping is True,
+                # since RigidContactAPI.read_from_physx asserts on it. Unlike the pose/DOF
+                # view APIs (snapshot-only, drained once per render-step in
+                # _refresh_state_caches), contacts accumulate per sub-step into pending
+                # buffers that update() later walks, so they must be drained here.
+                # Warmup-gated like the view-API calls above: play()'s two back-to-back
+                # internal warmup physics steps have no cache drain between them, so they
+                # overflow the pending buffers whenever n_physics_timesteps_per_render is
+                # 1, and play()'s update_handles() rebuilds the contact views right after,
+                # discarding any warmup capture regardless.
+                if not lazy.isaacsim.core.simulation_manager.SimulationManager._warmup_needed:
+                    RigidContactAPI.read_from_physx()
+                    wp.synchronize_stream(wp.get_stream())
 
-                for actor0_obj, actor1_obj in headers:
-                    for obj0, obj1 in [(actor0_obj, actor1_obj), (actor1_obj, actor0_obj)]:
-                        for state_type in self.object_state_types_on_contact:
-                            if state_type in obj0.states:
-                                obj0.states[state_type].on_contact(
-                                    obj1, headers[(actor0_obj, actor1_obj)], contact_data
-                                )
+                # Record that we are done with the step context. Joint-break callbacks below
+                # are post-step user code: they may call update_handles() / read Fabric, which
+                # is forbidden while currently_stepping=True.
+                self.currently_stepping = False
+
+                # Run any tensorized-state view rebuild that was deferred from a mid-step
+                # update_handles() (e.g. a joint created during grasping). Now that
+                # currently_stepping is False, the Fabric world-pose reads in initialize_view()
+                # are allowed. Do this before joint-break callbacks so they observe fresh views.
+                if self._deferred_tensorized_view_init:
+                    self._deferred_tensorized_view_init = False
+                    if gm.ENABLE_OBJECT_STATES:
+                        for state_type in og.sim.object_state_types_requiring_update:
+                            if issubclass(state_type, TensorizedState):
+                                state_type.initialize_view()
+                    TensorizedState.caches_dirty = True
+
+                if self._deferred_joint_breaks:
+                    # Copy the current deferred joint breaks and clear the shared list
+                    # before invoking callbacks, so we don't retain stale entries if a
+                    # callback raises an exception.
+                    deferred_breaks = list(self._deferred_joint_breaks)
+                    self._deferred_joint_breaks.clear()
+                    for obj, state_type, joint_path in deferred_breaks:
+                        obj.states[state_type].on_joint_break(joint_path)
+            except Exception as e:
+                self.currently_in_isaac_step = False
+                self.currently_stepping = False
+                self.post_step_exception = e
+                raise
+
+        def _report_step_exceptions(self):
+            if self.pre_step_exception is not None:
+                pre_step_exception = self.pre_step_exception
+                self.pre_step_exception = None
+                raise RuntimeError("Exception occurred during pre-physics step") from pre_step_exception
+            if self.post_step_exception is not None:
+                post_step_exception = self.post_step_exception
+                self.post_step_exception = None
+                raise RuntimeError("Exception occurred during post-physics step") from post_step_exception
 
         def get_obj_at_prim_path(self, prim_path):
             for scene in self.scenes:
@@ -1323,13 +1705,13 @@ def _launch_simulator(*args, **kwargs):
                         if obj is not None:
                             break
 
-                    if obj is None or not obj.initialized or not isinstance(obj, StatefulObject):
+                    if obj is None or not obj.initialized:
                         return
                     if len(obj.states.keys() & self.object_state_types_on_joint_break) == 0:
                         return
                     for state_type in self.object_state_types_on_joint_break:
                         if state_type in obj.states:
-                            obj.states[state_type].on_joint_break(joint_path)
+                            self._deferred_joint_breaks.append((obj, state_type, joint_path))
 
         def is_paused(self):
             """
@@ -1346,56 +1728,10 @@ def _launch_simulator(*args, **kwargs):
             # Store the original value, set the new value, yield, and then reset the original value
             original_value = self._render_on_step
             self._render_on_step = value
-            yield
-            self._render_on_step = original_value
-
-        @contextlib.contextmanager
-        def stopped(self):
-            """
-            A context scope for making sure the simulator is stopped during execution within this scope.
-            Upon leaving the scope, the prior simulator state is restored.
-            """
-            # Infer what state we're currently in, then stop, yield, and then restore the original state
-            sim_is_playing, sim_is_paused = self.is_playing(), self.is_paused()
-            if sim_is_playing or sim_is_paused:
-                self.stop()
-            yield
-            if sim_is_playing:
-                self.play()
-            elif sim_is_paused:
-                self.pause()
-
-        @contextlib.contextmanager
-        def playing(self):
-            """
-            A context scope for making sure the simulator is playing during execution within this scope.
-            Upon leaving the scope, the prior simulator state is restored.
-            """
-            # Infer what state we're currently in, then stop, yield, and then restore the original state
-            sim_is_stopped, sim_is_paused = self.is_stopped(), self.is_paused()
-            if sim_is_stopped or sim_is_paused:
-                self.play()
-            yield
-            if sim_is_stopped:
-                self.stop()
-            elif sim_is_paused:
-                self.pause()
-
-        @contextlib.contextmanager
-        def paused(self):
-            """
-            A context scope for making sure the simulator is paused during execution within this scope.
-            Upon leaving the scope, the prior simulator state is restored.
-            """
-            # Infer what state we're currently in, then stop, yield, and then restore the original state
-            sim_is_stopped, sim_is_playing = self.is_stopped(), self.is_playing()
-            if sim_is_stopped or sim_is_playing:
-                self.pause()
-            yield
-            if sim_is_stopped:
-                self.stop()
-            elif sim_is_playing:
-                self.play()
+            try:
+                yield
+            finally:
+                self._render_on_step = original_value
 
         @contextlib.contextmanager
         def slowed(self, slow_dt=1e-6):
@@ -1410,6 +1746,106 @@ def _launch_simulator(*args, **kwargs):
             self.set_simulation_dt(physics_dt=slow_dt, rendering_dt=slow_dt, sim_step_dt=slow_dt)
             yield
             self.set_simulation_dt(physics_dt=physics_dt, rendering_dt=rendering_dt, sim_step_dt=sim_step_dt)
+
+        @contextlib.contextmanager
+        def editing_usd(self, stage=None):
+            """
+            Context manager for USD edits with proper Fabric synchronization.
+
+            Under Fabric Scene Delegate (lazy USD-Fabric sync), USD edits are NOT automatically
+            propagated to Fabric. This context manager ensures that USD changes are synchronized
+            to Fabric (via SynchronizeToFabric) when the block exits, so that code immediately
+            after the block can rely on Fabric being up to date.
+
+            This context MUST NOT be nested — opening an editing_usd() context while another is
+            already open will raise an error. All USD edits within a single logical operation
+            should be in one context.
+
+            A guard (enabled after simulator init) detects any USD edits that occur outside this
+            context and raises a RuntimeError with a full backtrace.
+
+            Usage::
+
+                with og.sim.editing_usd():
+                    prim.set_attribute("someAttr", value)
+                    other_prim.visible = False
+                # USD is now synchronized to Fabric
+            """
+            # If the stage is a non-None value that's also not the simulator stage, we don't need to synchronize to Fabric.
+            if stage is not None and stage != self.stage:
+                yield
+                return
+
+            caller = traceback.extract_stack(limit=3)[0]
+            assert not self._editing_usd, (
+                f"Cannot nest editing_usd() contexts. All USD edits for a logical operation "
+                f"should be in a single editing_usd() block.\n"
+                f"  Existing context opened at: {self._editing_usd_caller}"
+            )
+            self._check_usd_guard()
+            assert not self.currently_in_isaac_step, "Cannot edit USD while simulation is stepping!"
+            self._editing_usd = True
+            self._editing_usd_caller = f"{caller.filename}:{caller.lineno} in {caller.name}"
+            try:
+                yield
+            finally:
+                self._editing_usd = False
+                self._editing_usd_caller = None
+                self.usdrt_stage.SynchronizeToFabric()
+
+        def _enable_usd_guard(self):
+            """Enable the guard that detects USD edits outside editing_usd() context."""
+            if self._usd_guard_enabled:
+                return
+            self._usd_guard_listener = lazy.pxr.Tf.Notice.Register(
+                lazy.pxr.Usd.Notice.ObjectsChanged, self._on_usd_objects_changed, self.stage
+            )
+            self._usd_guard_enabled = True
+
+        def _disable_usd_guard(self):
+            """Disable the USD edit guard."""
+            if self._usd_guard_listener is not None:
+                try:
+                    self._usd_guard_listener.Revoke()
+                except Exception:
+                    pass
+                self._usd_guard_listener = None
+            self._usd_guard_enabled = False
+
+        def _on_usd_objects_changed(self, notice, stage):
+            """Callback fired by Tf.Notice when USD objects change. Crashes if outside editing_usd()."""
+            if not self._usd_guard_enabled or self._editing_usd or self._in_sim_lifecycle > 0:
+                return
+
+            resynced = [str(p) for p in notice.GetResyncedPaths()]
+            info_only = [str(p) for p in notice.GetChangedInfoOnlyPaths()]
+            all_paths = resynced + info_only
+            if not all_paths:
+                return
+
+            # We can't raise here — Tf.Notice callbacks run inside C++ dispatch, which catches
+            # Python exceptions and converts them to TF errors without propagating. Instead, store
+            # the violation and raise it later at a point where exceptions propagate normally.
+            if self._deferred_usd_guard_error is None:
+                stack = "".join(traceback.format_stack()[:-1])
+                paths_str = "\n  ".join(all_paths[:20])
+                if len(all_paths) > 20:
+                    paths_str += f"\n  ... and {len(all_paths) - 20} more"
+                self._deferred_usd_guard_error = RuntimeError(
+                    f"USD edit detected outside of og.sim.editing_usd() context!\n"
+                    f"Changed paths:\n  {paths_str}\n"
+                    f"Stack trace:\n{stack}\n"
+                    f"All USD edits must be wrapped in a `with og.sim.editing_usd():` block "
+                    f"to ensure proper USD-Fabric synchronization."
+                )
+                print(self._deferred_usd_guard_error)
+
+        def _check_usd_guard(self):
+            """Raise any deferred USD guard error. Called at points where Python exceptions propagate."""
+            if self._deferred_usd_guard_error is not None:
+                error = self._deferred_usd_guard_error
+                self._deferred_usd_guard_error = None
+                raise error
 
         def add_callback_on_play(self, name, callback):
             """
@@ -1444,7 +1880,7 @@ def _launch_simulator(*args, **kwargs):
                 name (str): Name of the callback
                 callback (function): Callback function. Function signature is expected to be:
 
-                    def callback(obj: BaseObject) --> None
+                    def callback(obj: USDObject) --> None
             """
             self._callbacks_on_add_obj[name] = callback
 
@@ -1457,7 +1893,7 @@ def _launch_simulator(*args, **kwargs):
                 name (str): Name of the callback
                 callback (function): Callback function. Function signature is expected to be:
 
-                    def callback(obj: BaseObject) --> None
+                    def callback(obj: USDObject) --> None
             """
             self._callbacks_on_remove_obj[name] = callback
 
@@ -1540,30 +1976,6 @@ def _launch_simulator(*args, **kwargs):
             self._callbacks_on_system_clear.pop(name, None)
 
         @property
-        def pi(self):
-            """
-            Returns:
-                PhysX: Physx Interface (pi) for controlling low-level physx engine
-            """
-            return self._physx_interface
-
-        @property
-        def psi(self):
-            """
-            Returns:
-                IPhysxSimulation: Physx Simulation Interface (psi) for controlling low-level physx simulation
-            """
-            return self._physx_simulation_interface
-
-        @property
-        def psqi(self):
-            """
-            Returns:
-                PhysXSceneQuery: Physx Scene Query Interface (psqi) for running low-level scene queries
-            """
-            return self._physx_scene_query_interface
-
-        @property
         def scenes(self):
             """
             Returns:
@@ -1631,6 +2043,7 @@ def _launch_simulator(*args, **kwargs):
             # Handle loading scenes differently depending on whether we're loading from scratch or not
             if load_from_scratch:
                 states = []
+                recreated_scenes = []
                 self.stop()
                 for i, scene_file in enumerate(scene_files):
                     # Directly create and load the scene object
@@ -1654,9 +2067,10 @@ def _launch_simulator(*args, **kwargs):
                     # Also make sure we have any additional modifications necessary from the specific scene
                     og.REGISTERED_SCENES[init_info["class_name"]].modify_init_info_for_restoring(init_info=init_info)
 
-                    # Recreate and import the saved scene
-                    recreated_scene = create_object_from_init_info(init_info)
-                    self.import_scene(scene=recreated_scene)
+                    # Recreate the saved scene
+                    recreated_scenes.append(create_object_from_init_info(init_info))
+
+                self.import_scene(recreated_scenes)
                 self.play()
                 for i, state in enumerate(states):
                     self.scenes[i].load_state(state, serialized=False)
@@ -1714,6 +2128,15 @@ def _launch_simulator(*args, **kwargs):
             # Stop the physics
             self.stop()
 
+            # Clean subscribed callbacks
+            self._pre_physics_step_callback.unsubscribe()
+            self._post_physics_step_callback.unsubscribe()
+            self._simulation_event_callback.unsubscribe()
+
+            # Clear all tiled vision sensors first -- their render products reference per-scene cameras,
+            # so they must be destroyed before the scenes (and the cameras) are removed
+            TiledVisionSensor.clear()
+
             # Clear all scenes
             for scene in self.scenes:
                 scene.clear()
@@ -1736,24 +2159,27 @@ def _launch_simulator(*args, **kwargs):
 
             # Clear all global update states
             for state in self.object_state_types_requiring_update:
-                if issubclass(state, GlobalUpdateStateMixin):
+                if issubclass(state, TensorizedState):
                     state.global_initialize()
 
             # Clear all materials
             MaterialPrim.clear()
 
-            # Clear pose API cache
-            PoseAPI.clear()
-
             # Clear uniquely named items and other internal states
             clear_python_utils()
             clear_usd_utils()
+
+            # Clear all controller groups so robots re-register on next load
+            ControllerView.clear()
+
+            # Disable the USD guard - we don't care anymore
+            self._disable_usd_guard()
 
         def close(self):
             """
             Shuts down the OmniGibson application
             """
-            self._app.shutdown()
+            og.app.shutdown()
 
         @property
         def stage_id(self):
@@ -1797,14 +2223,6 @@ def _launch_simulator(*args, **kwargs):
             """
             return self._initial_rendering_dt
 
-        @property
-        def contact_sensor(self):
-            """
-            Returns:
-                ContactSensor: Contact sensor object
-            """
-            return self._contact_sensor
-
         def _dump_state(self):
             # Default state is from the scene
             return {i: scene.dump_state(serialized=False) for i, scene in enumerate(self.scenes)}
@@ -1818,7 +2236,7 @@ def _launch_simulator(*args, **kwargs):
             # We need to make sure the simulator is playing since joint states only get updated when playing
             assert self.is_playing()
 
-            # Run super
+            # Run Serializable.load_state (which calls _load_state)
             super().load_state(state=state, serialized=serialized)
 
             # Highlight that at the current step, the non-kinematic states are potentially inaccurate because a sim

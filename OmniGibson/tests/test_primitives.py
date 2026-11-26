@@ -49,10 +49,9 @@ def setup_environment(load_object_categories, robot="R1"):
     th.backends.cudnn.deterministic = True
 
     if og.sim is None:
-        # Make sure GPU dynamics are enabled (GPU dynamics needed for cloth) and no flatcache
+        # Make sure GPU dynamics are enabled (GPU dynamics needed for cloth)
         gm.ENABLE_OBJECT_STATES = True
         gm.USE_GPU_DYNAMICS = False
-        gm.ENABLE_FLATCACHE = False
         gm.ENABLE_TRANSITION_RULES = False
     else:
         # Make sure sim is stopped
@@ -79,7 +78,9 @@ def primitive_tester(env, objects, primitives, primitives_args):
     for _ in range(30):
         og.sim.step()
 
-    controller = StarterSemanticActionPrimitives(env, env.robots[0], enable_head_tracking=False, curobo_batch_size=1)
+    controller = StarterSemanticActionPrimitives(
+        env, env.scene.robots[0], enable_head_tracking=False, curobo_batch_size=1
+    )
     try:
         for primitive, args in zip(primitives, primitives_args):
             execute_controller(controller.apply_ref(primitive, *args, attempts=1), env)
@@ -88,7 +89,14 @@ def primitive_tester(env, objects, primitives, primitives_args):
         og.clear()
 
 
-@pytest.mark.parametrize("robot", ["Tiago", "R1"])
+ROBOTS_UNDER_TEST = ["Tiago", "R1"]
+if th.cuda.is_available() and th.cuda.get_device_capability(0) == (12, 0):
+    # TODO: Currently for 50 series, only Default embodiment works for Tiago, and for R1Pro, all embodiment except Default work.
+    # Here, we remove Tiago for testing.
+    ROBOTS_UNDER_TEST = ["R1"]
+
+
+@pytest.mark.parametrize("robot", ROBOTS_UNDER_TEST)
 class TestPrimitives:
     def test_navigate(self, robot):
         categories = ["floors", "ceilings", "walls"]

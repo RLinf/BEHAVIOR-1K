@@ -6,3 +6,8 @@ gha-creds-*.json
 # training
 outputs/
 /*.ipynb
+bddl3/build
+OmniGibson/appdata
+
+__pycache__/
+.codex

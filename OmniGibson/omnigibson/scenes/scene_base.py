@@ -7,15 +7,17 @@ from abc import ABC
 from pathlib import Path
 
 import torch as th
+from packaging.version import InvalidVersion, Version
 
 import omnigibson as og
 import omnigibson.lazy as lazy
+from omnigibson.sensors.vision_sensor import VisionSensor
 import omnigibson.utils.asset_utils
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
-from omnigibson.objects.object_base import BaseObject
+from omnigibson.objects.usd_object import USDObject
 from omnigibson.prims.xform_prim import XFormPrim
-from omnigibson.robots.robot_base import REGISTERED_ROBOTS, m as robot_macros
+from omnigibson.robots import REGISTERED_ROBOTS
 from omnigibson.systems import Cloth
 from omnigibson.systems.micro_particle_system import FluidSystem
 from omnigibson.systems.macro_particle_system import MacroParticleSystem
@@ -29,7 +31,7 @@ from omnigibson.systems.system_base import (
 from omnigibson.transition_rules import TransitionRuleAPI
 from omnigibson.utils.asset_utils import get_dataset_path
 from omnigibson.utils.config_utils import TorchEncoder
-from omnigibson.utils.constants import STRUCTURAL_DOOR_CATEGORIES
+from omnigibson.utils.constants import ROBOT_CATEGORY, STRUCTURAL_DOOR_CATEGORIES
 from omnigibson.utils.python_utils import (
     Recreatable,
     Registerable,
@@ -41,7 +43,7 @@ from omnigibson.utils.python_utils import (
 )
 from omnigibson.utils.registry_utils import SerializableRegistry
 from omnigibson.utils.ui_utils import create_module_logger
-from omnigibson.utils.usd_utils import CollisionAPI, add_asset_to_stage
+from omnigibson.utils.usd_utils import CollisionAPI, add_asset_to_stage, create_usd_stage
 
 # Create module logger
 log = create_module_logger(module_name=__name__)
@@ -116,6 +118,11 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                     scene_info = json.load(f)
             else:
                 scene_info = self.scene_file
+
+            # Verify the saved component versions are compatible with the currently-installed versions.
+            # We require each saved version to be <= the currently-installed version.
+            self._check_versions_compatible(scene_info.get("versions", {}))
+
             init_info = scene_info["objects_info"]["init_info"]
             # TODO: Remove this backwards-compatibility once newer RC is released
             self._init_state = (
@@ -175,7 +182,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         Get the objects in the scene.
 
         Returns:
-            list of BaseObject: Standalone object(s) that are currently in this scene
+            list of USDObject: Standalone object(s) that are currently in this scene
         """
         return self.object_registry.objects
 
@@ -196,7 +203,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         Returns:
             list of BaseRobot: Robot(s) that are currently in this scene
         """
-        return list(sorted(self.object_registry("category", robot_macros.ROBOT_CATEGORY, []), key=lambda x: x.name))
+        return list(sorted(self.object_registry("category", ROBOT_CATEGORY, []), key=lambda x: x.name))
 
     @property
     def systems(self):
@@ -287,7 +294,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             # Create a new stage inside the tempdir, named after this scene's file.
             decrypted_fd, usd_path = tempfile.mkstemp(os.path.basename(scene_file_path) + ".usd", dir=og.tempdir)
             os.close(decrypted_fd)
-            stage = lazy.pxr.Usd.Stage.CreateNew(usd_path)
+            stage = create_usd_stage(usd_path)
 
             # Create the world prim and make it the default
             world_prim = stage.DefinePrim("/World", "Xform")
@@ -371,34 +378,46 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                 log.warning(f"System {system_name} is not supported without GPU dynamics! Skipping...")
 
         # Position the scene prim initially at a z offset to avoid collision
-        self._scene_prim.set_position_orientation(
-            position=th.tensor([0, 0, initial_scene_prim_z_offset if self.idx != 0 else 0])
-        )
+        initial_scene_prim_pos = th.tensor([0.0, 0.0, initial_scene_prim_z_offset if self.idx != 0 else 0.0])
+        self._scene_prim.set_position_orientation(position=initial_scene_prim_pos)
 
         # Now load the objects with their own logic
         with og.sim.adding_objects(objs=self._init_objs.values()):
             for obj_name, obj in self._init_objs.items():
                 # Import into the simulator
                 self.add_object(obj, _batched_call=True)
-                # Set the init pose accordingly
+                # Set the init pose accordingly. The init pose is authored in the scene frame, and the
+                # scene prim currently sits at the temporary z offset above, so include that offset in
+                # this world-frame write. Otherwise the offset gets baked into the object's USD local
+                # transform (local = scene_z - (-offset) = scene_z + |offset|), and once the scene prim
+                # moves to its final tile position every object inherits a +|offset| world-z error.
+                # Later scene-relative load_state writes hide this for most objects, but any object
+                # that never receives one (e.g. scene furniture under the eval's partial-scene-load
+                # path, such as the stove burner in cook_hot_dogs) physically stays ~100 m above its
+                # scene in every env other than env 0.
                 obj.set_position_orientation(
-                    position=self._init_state[obj_name]["root_link"]["pos"],
+                    position=th.as_tensor(self._init_state[obj_name]["root_link"]["pos"]) + initial_scene_prim_pos,
                     orientation=self._init_state[obj_name]["root_link"]["ori"],
                 )
 
         # Position the scene prim based on the last scene's right edge
+        # NOTE: for empty scenes (no objects), the computed AABB is degenerate, so we manually use a zero extent
         if self.idx != 0:
             aabb_min, aabb_max = lazy.omni.usd.get_context().compute_path_world_bounding_box(scene_absolute_path)
-            left_edge_to_center = -aabb_min[0]
-            self._scene_prim.set_position_orientation(
-                position=[last_scene_edge + scene_margin + left_edge_to_center, 0, 0]
-            )
-            new_scene_edge = last_scene_edge + scene_margin + (aabb_max[0] - aabb_min[0])
+            left_edge_to_center = 0.0 if len(self._init_objs) == 0 else -aabb_min[0]
+            scene_position = th.tensor([last_scene_edge + scene_margin + left_edge_to_center, 0, 0])
+            identity_quat = th.tensor([0.0, 0.0, 0.0, 1.0])
+            self._scene_prim.set_position_orientation(position=scene_position, orientation=identity_quat)
+            if len(self._init_objs) == 0:
+                new_scene_edge = last_scene_edge + scene_margin
+            else:
+                new_scene_edge = last_scene_edge + scene_margin + (aabb_max[0] - aabb_min[0])
         else:
+            scene_position = th.zeros(3)
             aabb_min, aabb_max = lazy.omni.usd.get_context().compute_path_world_bounding_box(scene_absolute_path)
-            new_scene_edge = aabb_max[0]
+            new_scene_edge = 0.0 if len(self._init_objs) == 0 else aabb_max[0]
 
-        return new_scene_edge
+        return new_scene_edge, scene_position
 
     def _load_metadata_from_scene_file(self):
         """
@@ -466,16 +485,19 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
 
         # If we have any scene file specified, use it to load the objects within it and also update the initial state
         # and metadata
-        new_scene_edge = self._load_scene_prim_with_objects(**kwargs)
+        new_scene_edge, scene_position = self._load_scene_prim_with_objects(**kwargs)
         if self.scene_file is not None:
             self._load_metadata_from_scene_file()
 
-        # Cache this scene's pose
-        pos_ori = self._scene_prim.get_position_orientation()
+        # Cache this scene's pose using the position we just set, rather than reading
+        # it back from the prim, since the physics engine may not have processed the
+        # update yet (sim is stopped during load).
+        identity_quat = th.tensor([0.0, 0.0, 0.0, 1.0])
+        pos_ori = (scene_position, identity_quat)
         pose = T.pose2mat(pos_ori)
         self._pose_info = {
             "pos_ori": pos_ori,
-            "pose": T.pose2mat(pos_ori),
+            "pose": pose,
             "pose_inv": th.linalg.inv_ex(pose).inverse,
         }
 
@@ -496,6 +518,15 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         # Clears systems so they can be re-initialized.
         for system in self.active_systems.values():
             self.clear_system(system_name=system.name)
+
+        # Remove any vision sensors attached to this scene
+        # This needs to happen BEFORE the scene prim is removed or else the path to the sensor will become stale
+        # which will cause segfault during og.clear()
+        scene_prim_path = self.prim_path
+        scene_prim_prefix = f"{scene_prim_path}/"
+        for sensor in tuple(VisionSensor.SENSORS.values()):
+            if sensor.prim_path == scene_prim_path or sensor.prim_path.startswith(scene_prim_prefix):
+                sensor.remove()
 
         # Remove all of the scene's objects.
         og.sim.batch_remove_objects(list(self.objects))
@@ -547,7 +578,10 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                 obj_info["root_link"]["pos"], obj_info["root_link"]["ori"] = T.pose_transform(
                     *T.mat2pose(self.pose), pos, ori
                 )
-            # TODO: also handle system registry here
+            # NOTE: system registry states need no such conversion -- particle systems dump/load
+            # their particle poses in the SCENE frame (see BaseSystem._dump_state and
+            # PhysxParticleInstancer._dump_state), so load_state below places each scene's particles
+            # at that scene's own world offset.
             self.load_state(init_state, serialized=False)
         self._initial_file = self.save(as_dict=True)
 
@@ -580,7 +614,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         registry.add(
             obj=SerializableRegistry(
                 name="object_registry",
-                class_types=BaseObject,
+                class_types=USDObject,
                 default_key="name",
                 hash_key="uuid",
                 unique_keys=self.object_registry_unique_keys,
@@ -637,7 +671,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         scene.load() is called. The object should also be accessible through scene.objects.
 
         Args:
-            obj (BaseObject): the object to load into the simulator
+            obj (USDObject): the object to load into the simulator
         """
         pass
 
@@ -646,7 +680,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         Add an object to the scene. The scene should already be loaded.
 
         Args:
-            obj (BaseObject): the object to load
+            obj (USDObject): the object to load
             register (bool): Whether to register @obj internally in the scene object registry or not, as well as run
                 additional scene-specific logic in addition to the obj being loaded
             _batched_call (bool): Whether this is from a batched call or not. If True, will avoid running
@@ -666,7 +700,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                 # If this object is fixed and is NOT an agent, disable collisions between the fixed links of the fixed objects
                 # This is to account for cases such as Tiago, which has a fixed base which is needed for its global base joints
                 # We do this by adding the object to our tracked collision groups
-                if obj.fixed_base and obj.category != robot_macros.ROBOT_CATEGORY and not obj.visual_only:
+                if obj.fixed_base and obj.category != ROBOT_CATEGORY and not obj.visual_only:
                     obj_fixed_links = obj.get_fixed_link_names_in_subtree()
                     for link_name, link in obj.links.items():
                         if link_name in obj_fixed_links:
@@ -691,7 +725,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         Method to remove an object from the simulator
 
         Args:
-            obj (BaseObject): Object to remove
+            obj (USDObject): Object to remove
             _batched_call (bool): Whether this is from a batched call or not. If True, will avoid running
                 a context externally. In general, this should NOT be explicitly set by the user
         """
@@ -756,25 +790,8 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
 
         # Dump saved current state and also scene init info
         scene_info = {
-            # TODO: Use these to verify compatibility at load time.
-            "versions": {
-                "omnigibson": {
-                    "version": omnigibson.utils.asset_utils.get_omnigibson_version(),
-                    "git_hash": omnigibson.utils.asset_utils.get_omnigibson_git_hash(),
-                },
-                "bddl": {
-                    "version": omnigibson.utils.asset_utils.get_bddl_version(),
-                    "git_hash": omnigibson.utils.asset_utils.get_bddl_git_hash(),
-                },
-                "behavior-1k-assets": {
-                    "version": omnigibson.utils.asset_utils.get_behavior_1k_assets_version(),
-                },
-                "omnigibson-robot-assets": {
-                    "version": omnigibson.utils.asset_utils.get_omnigibson_robot_asset_version(),
-                    "git_hash": omnigibson.utils.asset_utils.get_omnigibson_robot_asset_git_hash(),
-                },
-            },
-            "metadata": self._task_metadata,
+            "versions": self._get_current_versions(),
+            "metadata": {"task": self._task_metadata},
             "state": self.dump_state(serialized=False),
             "init_info": self.get_init_info(),
             "objects_info": self.get_objects_info(),
@@ -791,9 +808,78 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
 
             log.info(f"Scene {self.idx} saved to {json_path}.")
 
+    @staticmethod
+    def _get_current_versions():
+        """
+        Returns:
+            dict: Dictionary of currently-installed component versions, in the same shape that is stored
+                under the "versions" key of a saved scene file.
+        """
+        return {
+            "omnigibson": {
+                "version": omnigibson.utils.asset_utils.get_omnigibson_version(),
+                "git_hash": omnigibson.utils.asset_utils.get_omnigibson_git_hash(),
+            },
+            "bddl": {
+                "version": omnigibson.utils.asset_utils.get_bddl_version(),
+            },
+            "behavior-1k-assets": {
+                "version": omnigibson.utils.asset_utils.get_behavior_1k_assets_version(),
+            },
+            "omnigibson-robot-assets": {
+                "version": omnigibson.utils.asset_utils.get_omnigibson_robot_asset_version(),
+            },
+        }
+
+    @staticmethod
+    def _check_versions_compatible(saved_versions):
+        """
+        Validates that each component version saved in @saved_versions is less than or equal to the
+        currently-installed version. This prevents loading a scene that was saved against newer
+        components than what is currently available.
+
+        Args:
+            saved_versions (dict): The "versions" sub-dictionary from a saved scene file.
+
+        Raises:
+            ValueError: If any saved version is strictly newer than the currently-installed version.
+        """
+        if not saved_versions:
+            log.warning("Scene file does not contain version information; skipping version compatibility check.")
+            return
+
+        current_versions = Scene._get_current_versions()
+        for component, current_info in current_versions.items():
+            saved_info = saved_versions.get(component)
+            if not saved_info:
+                continue
+            saved_version_str = saved_info.get("version")
+            current_version_str = current_info.get("version")
+            if saved_version_str is None or current_version_str is None:
+                continue
+            try:
+                saved_version = Version(saved_version_str)
+                current_version = Version(current_version_str)
+            except InvalidVersion:
+                log.warning(
+                    f"Could not parse version for {component} (saved={saved_version_str}, "
+                    f"current={current_version_str}); skipping comparison for this component."
+                )
+                continue
+            if saved_version > current_version:
+                raise ValueError(
+                    f"Scene file was saved with {component} version {saved_version_str}, which is newer than "
+                    f"the currently-installed version {current_version_str}. Please update {component} before "
+                    f"loading this scene."
+                )
+
     def restore(self, scene_file, update_initial_file=False):
         """
         Restores this scene given @scene_file
+
+        This does NOT move the scene prim to the pose recorded in @scene_file: that
+        pose identifies the frame the file was captured in, and object poses are
+        re-based from it into this scene's current frame. See ``_dump_state``.
 
         Args:
             scene_file (str or dict): Full path of either JSON file or loaded scene file to load, which contains
@@ -813,13 +899,21 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                 scene_info = json.load(f)
         else:
             scene_info = scene_file
+
+        # Verify the saved component versions are compatible with the currently-installed versions.
+        # We require each saved version to be <= the currently-installed version.
+        self._check_versions_compatible(scene_info.get("versions", {}))
+
         init_info = scene_info["init_info"]
         # The saved state are lists, convert them to torch tensors
         state = recursively_convert_to_torch(scene_info["state"])
 
         # Recover metadata
-        for key, data in scene_info.get("metadata", dict()).items():
-            self.write_task_metadata(key=key, data=data)
+        if "metadata" in scene_info:
+            metadata = scene_info["metadata"]
+            task_metadata = metadata["task"] if "task" in metadata else metadata
+            for key, data in task_metadata.items():
+                self.write_task_metadata(key=key, data=data)
 
         # Make sure the class type is the same
         if self.__class__.__name__ != init_info["class_name"]:
@@ -827,20 +921,35 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                 f"Got mismatch in scene type: current is type {self.__class__.__name__}, trying to load type {init_info['class_name']}"
             )
 
-        # Synchronize systems -- we need to check for pruning currently-existing systems,
-        # as well as creating any non-existing systems
+        # Work out every topology change before touching either systems or objects. System
+        # clear/init can remove/add particle template objects, so it must participate in the
+        # same stop -> mutate topology -> play lifecycle as ordinary object changes.
         current_systems = set(self.active_systems.keys())
         load_systems = set(scene_info["state"]["registry"]["system_registry"].keys())
         systems_to_remove = current_systems - load_systems
         systems_to_add = load_systems - current_systems
+        load_obj_names = set(scene_info["objects_info"]["init_info"].keys())
+        current_obj_names = set(self.object_registry.get_dict("name").keys())
+        object_topology_changed = current_obj_names != load_obj_names
+
+        restart_sim = bool(systems_to_remove or systems_to_add or object_topology_changed) and og.sim.is_playing()
+
+        if restart_sim:
+            og.sim.stop()
+
+        # Synchronize systems -- we need to check for pruning currently-existing systems,
+        # as well as creating any non-existing systems. This is deliberately after stop():
+        # MacroParticleSystem.clear() removes its particle template object, and doing that
+        # while playing enters Simulator.removing_objects(), which first dumps the entire
+        # simulation through tensor views that a prior transition may already have invalidated.
         for name in systems_to_remove:
             self.clear_system(name)
         for name in systems_to_add:
             self.get_system(name, force_init=True)
 
+        # System init / clear can itself add or remove particle-template objects. Recompute the
+        # object delta afterwards so those objects are not removed twice or recreated manually.
         current_obj_names = set(self.object_registry.get_dict("name").keys())
-        load_obj_names = set(scene_info["objects_info"]["init_info"].keys())
-
         objs_to_remove = current_obj_names - load_obj_names
         objs_to_add = load_obj_names - current_obj_names
 
@@ -853,7 +962,12 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             create_object_from_init_info(scene_info["objects_info"]["init_info"][obj_to_add])
             for obj_to_add in objs_to_add
         ]
+        # Add new physics prims while stopped, then reuse play() to rebuild handles before loading poses.
+
         og.sim.batch_add_objects(objects_to_add, scenes=[self] * len(objects_to_add))
+
+        if restart_sim:
+            og.sim.play()
 
         # Load state
         self.load_state(state, serialized=False)
@@ -887,9 +1001,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             orientation (th.Tensor): (4,) orientation of the scene
         """
         self._scene_prim.set_position_orientation(position=position, orientation=orientation)
-        # Need to update sim here -- this is because downstream setters called immediately may not be respected,
-        # e.g. during load_state() call when specific objects have just been added to the simulator in this scene
-        og.sim.pi.update_simulation(elapsedStep=0, currentTime=og.sim.current_time)
+
         # Update the cached pose and inverse pose
         pos_ori = self._scene_prim.get_position_orientation()
         pose = T.pose2mat(pos_ori)
@@ -935,7 +1047,7 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         return {
             obj.name: obj
             for obj in self.object_registry("fixed_base", True, default_val=[])
-            if obj.category != robot_macros.ROBOT_CATEGORY
+            if obj.category != ROBOT_CATEGORY
         }
 
     @property
@@ -1030,6 +1142,10 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
             # Remove from system registry and clear
             self.system_registry.remove(system)
             system.clear()
+
+            # Clearing a system deletes prims, which invalidates the PhysX tensor views of
+            # unrelated objects. Update handles accordingly.
+            og.sim.update_handles()
 
     @property
     def active_systems(self):
@@ -1145,6 +1261,13 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         return self._objects_info
 
     def _dump_state(self):
+        """Dumps this scene's state.
+
+        ``pos``/``ori`` record where the scene sat when the state was taken; loading uses them to
+        shift object poses over to wherever the scene sits now, and never moves the scene itself.
+        Moving it would stack every scene on the same spot when running several at once, so their
+        objects would collide.
+        """
         # Default state for the scene is from the registry alone
         pos, ori = self.get_position_orientation()
         return {
@@ -1157,10 +1280,103 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
         # Load scene state, then registry
         # TODO: Remove backwards compatible check once new scene RC is updated
         if "pos" in state:
-            self.set_position_orientation(position=state["pos"], orientation=state["ori"])
-            self._registry.load_state(state=state["registry"], serialized=False)
+            # ("pos", "ori") say where the scene sat when the state was taken. Leave this scene
+            # where it is and shift the object poses over instead, so that running several
+            # scenes at once does not pile them all onto the recorded spot and let their
+            # objects collide.
+            rec_pos = th.as_tensor(state["pos"], dtype=th.float32).reshape(3)
+            rec_ori = th.as_tensor(state["ori"], dtype=th.float32).reshape(4)
+            cur_pos, cur_ori = self.get_position_orientation()
+            registry_state = state["registry"]
+            if not (th.equal(rec_pos, cur_pos) and th.equal(rec_ori, cur_ori)):
+                # rel = cur ∘ rec⁻¹ moves a recorded pose over to this scene. When the two
+                # match, this branch is skipped and the poses load unchanged.
+                inv_rec_pos, inv_rec_ori = T.invert_pose_transform(rec_pos, rec_ori)
+                rel_pos, rel_ori = T.pose_transform(cur_pos, cur_ori, inv_rec_pos, inv_rec_ori)
+                registry_state = self._rebase_registry_state_poses(registry_state, rel_pos, rel_ori)
+            self._registry.load_state(state=registry_state, serialized=False)
         else:
             self._registry.load_state(state=state, serialized=False)
+
+    @staticmethod
+    def _rebase_registry_state_poses(registry_state, rel_pos, rel_ori):
+        """Returns a copy of @registry_state with object poses moved over by (rel_pos, rel_ori).
+
+        Objects have their positions moved and their velocities rotated. Particle systems are
+        different: their positions are already stored relative to the scene, so only their
+        velocities need rotating. Velocities are only ever rotated, never moved.
+
+        The input dicts are left untouched, since callers reuse them across calls.
+        """
+        rebased = dict(registry_state)
+        object_registry = registry_state.get("object_registry")
+        if object_registry is None:
+            return rebased
+        new_object_registry = {}
+        for name, obj_state in object_registry.items():
+            root = obj_state.get("root_link") if isinstance(obj_state, dict) else None
+            if not isinstance(root, dict) or "pos" not in root:
+                new_object_registry[name] = obj_state
+                continue
+            new_root = dict(root)
+            new_root["pos"], new_root["ori"] = T.pose_transform(
+                rel_pos,
+                rel_ori,
+                th.as_tensor(root["pos"], dtype=th.float32).reshape(3),
+                th.as_tensor(root["ori"], dtype=th.float32).reshape(4),
+            )
+            for vec_key in ("lin_vel", "ang_vel", "particle_velocities"):
+                if vec_key in root:
+                    vec = th.as_tensor(root[vec_key], dtype=th.float32)
+                    new_root[vec_key] = T.quat_apply(rel_ori, vec).reshape(vec.shape)
+            if "particle_positions" in root:
+                pts = th.as_tensor(root["particle_positions"], dtype=th.float32)
+                new_root["particle_positions"] = (T.quat_apply(rel_ori, pts) + rel_pos).reshape(pts.shape)
+            new_obj_state = dict(obj_state)
+            new_obj_state["root_link"] = new_root
+            new_object_registry[name] = new_obj_state
+        rebased["object_registry"] = new_object_registry
+
+        system_registry = registry_state.get("system_registry")
+        if isinstance(system_registry, dict):
+            new_system_registry = {}
+            for name, sys_state in system_registry.items():
+                if not isinstance(sys_state, dict):
+                    new_system_registry[name] = sys_state
+                    continue
+                new_sys_state = Scene._rebase_system_velocities(sys_state, rel_ori)
+                new_system_registry[name] = new_sys_state
+            rebased["system_registry"] = new_system_registry
+        return rebased
+
+    @staticmethod
+    def _rebase_system_velocities(sys_state, rel_ori):
+        """Returns a copy of a system state with its world-frame velocity fields rotated.
+
+        Recurses one level into nested per-instancer dicts (micro systems keep a dict of
+        instancer states), and leaves every other field -- including scene-relative
+        particle positions and orientations -- untouched.
+        """
+        rotated = dict(sys_state)
+        changed = False
+        for key in ("particle_velocities", "lin_velocities", "ang_velocities"):
+            value = sys_state.get(key)
+            if value is None:
+                continue
+            vec = th.as_tensor(value, dtype=th.float32)
+            if vec.numel() == 0:
+                continue
+            rotated[key] = T.quat_apply(rel_ori, vec.reshape(-1, 3)).reshape(vec.shape)
+            changed = True
+        for key, value in sys_state.items():
+            if key in ("particle_velocities", "lin_velocities", "ang_velocities"):
+                continue
+            if isinstance(value, dict):
+                nested = Scene._rebase_system_velocities(value, rel_ori)
+                if nested is not value:
+                    rotated[key] = nested
+                    changed = True
+        return rotated if changed else sys_state
 
     def serialize(self, state):
         return th.cat([state["pos"], state["ori"], self._registry.serialize(state=state["registry"])])

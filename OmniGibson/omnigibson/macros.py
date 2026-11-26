@@ -158,10 +158,20 @@ gm.GUI_VIEWPORT_ONLY = False
 # Whether to use the viewer camera or not
 gm.RENDER_VIEWER_CAMERA = True
 
+# Whether to batch all per-env robot cameras into a single tiled render product when num_envs > 1.
+# Tiled rendering issues one render pass for every env instead of one per camera, which is much faster
+# at high env counts, but it fixes camera resolution at creation time and returns raw (unremapped)
+# segmentation IDs without the per-modality info dicts. When False, every env renders through its own
+# per-camera render product, regardless of num_envs.
+gm.ENABLE_TILED_RENDERING = os.getenv("OMNIGIBSON_ENABLE_TILED_RENDERING", "False").lower() in ("true", "1", "t")
+
 # Do not suppress known omni warnings / errors, and also put omnigibson in a debug state
 # This includes extra information for things such as object sampling, and also any debug
 # logging messages
 gm.DEBUG = os.getenv("OMNIGIBSON_DEBUG", "False").lower() in ("true", "1", "t")
+
+# Whether to enable profiling or not in simulator.py - this causes a slowdown!
+gm.ENABLE_DEEP_PROFILING = False
 
 # Whether to suppress any omni logs upon startup, and prune the following omni logs to error level
 gm.NO_OMNI_LOGS = os.getenv("OMNIGIBSON_NO_OMNI_LOGS", "False").lower() in ("true", "1", "t")
@@ -175,9 +185,6 @@ gm.USE_GPU_DYNAMICS = False
 
 # Whether to use high-fidelity rendering (this includes, e.g., isosurfaces)
 gm.ENABLE_HQ_RENDERING = False
-
-# Whether to use omni's flatcache feature or not (can speed up simulation)
-gm.ENABLE_FLATCACHE = False
 
 # Whether to use continuous collision detection or not (slower simulation, but can prevent
 # objects from tunneling through each other)
@@ -213,14 +220,8 @@ gm.DEFAULT_SIM_STEP_FREQ = 30
 gm.DEFAULT_RENDERING_FREQ = 30
 gm.DEFAULT_PHYSICS_FREQ = 120
 
-# (Demo-purpose) Whether to activate Assistive Grasping mode for Cloth (it's handled differently from RigidBody)
-gm.AG_CLOTH = False
-
 # Forced light intensity for all DatasetObjects. None if the USD-provided intensities should be respected.
 gm.FORCE_LIGHT_INTENSITY = 10000
-
-# Whether to default the dataset objects to use the shipped V-Ray or OmniPBR materials
-gm.USE_PBR_MATERIALS = False
 
 # Forced roughness for all DatasetObjects. None if the USD-provided roughness maps should be respected.
 gm.FORCE_ROUGHNESS = 0.7
@@ -231,6 +232,9 @@ gm.FORCE_CATEGORY_MASS = True
 
 # Disable collision and gravity for the simulator, should default to False
 gm.VISUAL_ONLY = False
+
+# Whether to enable VR extension support
+gm.ENABLE_VR = os.getenv("OMNIGIBSON_VR", "False").lower() in ("true", "1", "t")
 
 
 # Create helper function for generating sub-dictionaries

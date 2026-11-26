@@ -4,6 +4,7 @@ set -e
 # Parse arguments
 HELP=false
 NEW_ENV=false
+NEW_ENV_NAME="behavior"
 OMNIGIBSON=false
 BDDL=false
 JOYLO=false
@@ -12,18 +13,29 @@ PRIMITIVES=false
 EVAL=false
 ASSET_PIPELINE=false
 DEV=false
-CUDA_VERSION="12.4"
+CUDA_VERSION="12.8"
 ACCEPT_CONDA_TOS=false
 ACCEPT_NVIDIA_EULA=false
 ACCEPT_DATASET_TOS=false
 CONFIRM_NO_CONDA=false
+USE_UV=false
 
 [ "$#" -eq 0 ] && HELP=true
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help) HELP=true; shift ;;
-        --new-env) NEW_ENV=true; shift ;;
+        --new-env)
+            NEW_ENV=true
+            # support: --new-env NAME or just --new-env (use default)
+            if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+                NEW_ENV_NAME="$2"
+                shift 2
+            else
+                NEW_ENV_NAME="behavior"
+                shift 1
+            fi
+            ;;
         --omnigibson) OMNIGIBSON=true; shift ;;
         --bddl) BDDL=true; shift ;;
         --joylo) JOYLO=true; shift ;;
@@ -32,14 +44,21 @@ while [[ $# -gt 0 ]]; do
         --eval) EVAL=true; shift ;;
         --asset-pipeline) ASSET_PIPELINE=true; shift ;;
         --dev) DEV=true; shift ;;
-        --cuda-version) CUDA_VERSION="\$2"; shift 2 ;;
+        --cuda-version) CUDA_VERSION="$2"; shift 2 ;;
         --accept-conda-tos) ACCEPT_CONDA_TOS=true; shift ;;
         --accept-nvidia-eula) ACCEPT_NVIDIA_EULA=true; shift ;;
         --accept-dataset-tos) ACCEPT_DATASET_TOS=true; shift ;;
+        --use-uv) USE_UV=true; shift ;;
         --confirm-no-conda) CONFIRM_NO_CONDA=true; shift ;;
-        *) echo "Unknown option: \$1"; exit 1 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Validate CUDA_VERSION is a valid numeric version string
+if ! [[ "$CUDA_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: Invalid CUDA_VERSION '$CUDA_VERSION'. Must be in format X.Y (e.g., 12.8)"
+    exit 1
+fi
 
 if [ "$HELP" = true ]; then
     cat << EOF
@@ -48,7 +67,7 @@ Usage: ./setup.sh [OPTIONS]
 
 Options:
   -h, --help              Display this help message
-  --new-env               Create a new conda environment 'behavior'
+  --new-env NEW_ENV_NAME  Create a new conda environment 'NEW_ENV_NAME' (default: behavior)
   --omnigibson            Install OmniGibson (core physics simulator)
   --bddl                  Install BDDL (Behavior Domain Definition Language)
   --joylo                 Install JoyLo (teleoperation interface)
@@ -57,13 +76,19 @@ Options:
   --eval                  Install evaluation dependencies
   --asset-pipeline        Install the 3D scene and object asset pipeline
   --dev                   Install development dependencies
-  --cuda-version VERSION  Specify CUDA version (default: 12.4)
+  --cuda-version VERSION  Specify CUDA version (default: 12.8)
   --accept-conda-tos      Automatically accept Conda Terms of Service
   --accept-nvidia-eula    Automatically accept NVIDIA Isaac Sim EULA
   --accept-dataset-tos    Automatically accept BEHAVIOR Dataset Terms
+  --use-uv                Install Python packages with uv
   --confirm-no-conda      Skip confirmation prompt when not in a conda environment
 
-Example: ./setup.sh --new-env --omnigibson --bddl --joylo --dataset
+Environment:
+  ISAAC_SIM_WHEEL_PATH    Local directory of Isaac Sim wheels for the x86_64 installer
+  ISAAC_SIM_PYPI_URL      NVIDIA package index (default: https://pypi.nvidia.com)
+
+Example (core components): ./setup.sh --new-env --omnigibson --bddl --dataset
+Example (full customization): ./setup.sh --new-env my_env --omnigibson --bddl --dataset --joylo --eval --primitives --cuda-version 12.6
 Example (non-interactive): ./setup.sh --new-env --omnigibson --dataset --accept-conda-tos --accept-nvidia-eula --accept-dataset-tos
 EOF
     exit 0
@@ -77,6 +102,21 @@ fi
 [ "$NEW_ENV" = true ] && [ "$CONFIRM_NO_CONDA" = true ] && { echo "ERROR: --new-env and --confirm-no-conda are mutually exclusive"; exit 1; }
 
 WORKDIR=$(pwd)
+ARCH=$(uname -m)
+NVIDIA_INDEX=${ISAAC_SIM_PYPI_URL:-https://pypi.nvidia.com}
+if [ "$USE_UV" = true ]; then
+    command -v uv >/dev/null || { echo "ERROR: uv package manager not found"; exit 1; }
+fi
+
+run_pip() {
+    if [ "$USE_UV" = true ]; then
+        local subcommand=$1
+        shift
+        uv pip "$subcommand" --python "$(command -v python)" "$@"
+    else
+        python -m pip "$@"
+    fi
+}
 
 # Check conda environment condition early (unless creating new environment)
 if [ "$NEW_ENV" = false ]; then
@@ -152,7 +192,7 @@ EOF
         cat << EOF
 3. BEHAVIOR DATA BUNDLE END USER LICENSE AGREEMENT
     Last revision: December 8, 2022
-    This License Agreement is for the BEHAVIOR Data Bundle (“Data”). It works with OmniGibson (“Software”) which is a software stack licensed under the MIT License, provided in this repository: https://github.com/StanfordVL/BEHAVIOR-1K. 
+    This License Agreement is for the BEHAVIOR Data Bundle (“Data”). It works with OmniGibson (“Software”) which is a software stack licensed under the MIT License, provided in this repository: https://github.com/StanfordVL/BEHAVIOR-1K.
     The license agreements for OmniGibson and the Data are independent. This BEHAVIOR Data Bundle contains artwork and images (“Third Party Content”) from third parties with restrictions on redistribution. 
     It requires measures to protect the Third Party Content which we have taken such as encryption and the inclusion of restrictions on any reverse engineering and use. 
     Recipient is granted the right to use the Data under the following terms and conditions of this License Agreement (“Agreement”):
@@ -189,9 +229,26 @@ EOF
 # Prompt for terms acceptance at the beginning
 prompt_for_terms
 
+# If primitives requested, ensure a matching system CUDA is available
+if [ "$PRIMITIVES" = true ]; then
+    NVCC_OK=false
+    if command -v nvcc >/dev/null 2>&1; then
+        if nvcc -V 2>&1 | grep -q "$CUDA_VERSION"; then
+            NVCC_OK=true
+        fi
+    fi
+
+    if [ "$NVCC_OK" = false ]; then
+        echo ""
+        echo "ERROR: Primitives support requires CUDA Toolkit $CUDA_VERSION and a matching 'nvcc' in PATH."
+        echo "Please install the correct CUDA toolkit system-wide (for example /usr/local/cuda-$CUDA_VERSION) or ensure your PATH provides an nvcc that reports $CUDA_VERSION, then re-run this script."
+        exit 1
+    fi
+fi
+
 # Create conda environment
 if [ "$NEW_ENV" = true ]; then
-    echo "Creating conda environment 'behavior'..."
+    echo "Creating conda environment '$NEW_ENV_NAME'..."
     command -v conda >/dev/null || { echo "ERROR: Conda not found"; exit 1; }
     
     # Set auto-accept environment variable if user agreed to TOS
@@ -201,41 +258,48 @@ if [ "$NEW_ENV" = true ]; then
     fi
     
     source "$(conda info --base)/etc/profile.d/conda.sh"
-    
+
     # Check if environment already exists and exit with instructions
-    if conda env list | grep -q "^behavior "; then
+    if conda env list | grep -q "^$NEW_ENV_NAME "; then
         echo ""
-        echo "ERROR: Conda environment 'behavior' already exists!"
+        echo "ERROR: Conda environment '$NEW_ENV_NAME' already exists!"
         echo ""
         echo "Please remove or rename the existing environment and re-run this script."
         echo ""
         exit 1
     fi
     
-    # Create environment with only Python 3.10
-    conda create -n behavior python=3.10 -c conda-forge -y
-    conda activate behavior
+    # Create environment with Python 3.11 and packaging tools used by this script
+    conda create -n "$NEW_ENV_NAME" python=3.11 pip "setuptools>=71,<81" wheel -c conda-forge -y
+    conda activate "$NEW_ENV_NAME"
     
-    [[ "$CONDA_DEFAULT_ENV" != "behavior" ]] && { echo "ERROR: Failed to activate environment"; exit 1; }
-    
-    # Install numpy and setuptools via pip
-    echo "Installing numpy and setuptools..."
-    pip install "numpy<2" "setuptools<=79"
-    
-    # Install PyTorch via pip with CUDA support
-    echo "Installing PyTorch with CUDA $CUDA_VERSION support..."
-    
-    # Determine the CUDA version string for pip URL (e.g., cu126, cu124, etc.)
-    CUDA_VER_SHORT=$(echo $CUDA_VERSION | sed 's/\.//g')  # e.g. convert 12.6 to 126
-    
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu${CUDA_VER_SHORT}
-    echo "✓ PyTorch installation completed"
+    [[ "$CONDA_DEFAULT_ENV" != "$NEW_ENV_NAME" ]] && { echo "ERROR: Failed to activate environment '$NEW_ENV_NAME'"; exit 1; }
+
 fi
+
+# Install PyTorch via pip with CUDA support
+echo "Installing PyTorch with CUDA $CUDA_VERSION support..."
+
+# Determine the CUDA version string for pip URL (e.g., cu128, cu126, etc.)
+CUDA_VER_SHORT=$(echo "$CUDA_VERSION" | sed 's/\.//g')  # e.g. convert 12.8 to 128
+
+run_pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 torchcodec==0.5 --index-url https://download.pytorch.org/whl/cu${CUDA_VER_SHORT}
+
+echo "✓ PyTorch installation completed"
+
+# Install numpy <2 to avoid conflicts
+echo "Installing numpy..."
+run_pip install "numpy<2"
+
 # Install BDDL
 if [ "$BDDL" = true ]; then
     echo "Installing BDDL..."
-    [ ! -d "bddl" ] && { echo "ERROR: bddl directory not found"; exit 1; }
-    pip install -e "$WORKDIR/bddl"
+    [ ! -d "bddl3" ] && { echo "ERROR: bddl directory not found"; exit 1; }
+    if [ "$USE_UV" = true ]; then
+        run_pip install "$WORKDIR/bddl3"
+    else
+        run_pip install -e "$WORKDIR/bddl3"
+    fi
 fi
 
 # Install OmniGibson with Isaac Sim
@@ -245,7 +309,7 @@ if [ "$OMNIGIBSON" = true ]; then
     
     # Check Python version
     PYTHON_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    [ "$PYTHON_VERSION" != "3.10" ] && { echo "ERROR: Python 3.10 required, found $PYTHON_VERSION"; exit 1; }
+    [ "$PYTHON_VERSION" != "3.11" ] && { echo "ERROR: Python 3.11 required, found $PYTHON_VERSION"; exit 1; }
     
     # Check for conflicting environment variables
     if [[ -n "$EXP_PATH" || -n "$CARB_APP_PATH" || -n "$ISAAC_PATH" ]]; then
@@ -253,7 +317,7 @@ if [ "$OMNIGIBSON" = true ]; then
         echo "Please unset EXP_PATH, CARB_APP_PATH, and ISAAC_PATH and restart."
         exit 1
     fi
-    
+
     # Build extras
     EXTRAS=""
     if [ "$DEV" = true ]; then
@@ -270,14 +334,18 @@ if [ "$OMNIGIBSON" = true ]; then
         EXTRAS="[${EXTRAS%,}]"
     fi
 
-    pip install -e "$WORKDIR/OmniGibson$EXTRAS"
+    run_pip install -e "$WORKDIR/OmniGibson$EXTRAS" --no-build-isolation
 
     # Install pre-commit for dev setup
     if [ "$DEV" = true ]; then
         echo "Setting up pre-commit..."
-        conda install -c conda-forge pre-commit -y
+        if [ "$USE_UV" = true ]; then
+            run_pip install pre-commit
+        else
+            conda install -c conda-forge pre-commit -y
+        fi
         cd "$WORKDIR/OmniGibson"
-        pre-commit install
+        pre-commit install || true  # Ignore errors here in case the directory is not a git repo
         cd "$WORKDIR"
     fi
     
@@ -294,70 +362,132 @@ if [ "$OMNIGIBSON" = true ]; then
         echo "Isaac Sim already installed, skipping..."
     else
         echo "Installing Isaac Sim via pip..."
-        
-        # Helper functions
-        check_glibc_old() {
-            ldd --version 2>&1 | grep -qE "2\.(31|32|33)"
-        }
-        
-        install_isaac_packages() {
-            local temp_dir=$(mktemp -d)
-            local packages=(
-                "omniverse_kit-106.5.0.162521" "isaacsim_kernel-4.5.0.0" "isaacsim_app-4.5.0.0"
-                "isaacsim_core-4.5.0.0" "isaacsim_gui-4.5.0.0" "isaacsim_utils-4.5.0.0"
-                "isaacsim_storage-4.5.0.0" "isaacsim_asset-4.5.0.0" "isaacsim_sensor-4.5.0.0"
-                "isaacsim_robot_motion-4.5.0.0" "isaacsim_robot-4.5.0.0" "isaacsim_benchmark-4.5.0.0"
-                "isaacsim_code_editor-4.5.0.0" "isaacsim_ros1-4.5.0.0" "isaacsim_cortex-4.5.0.0"
-                "isaacsim_example-4.5.0.0" "isaacsim_replicator-4.5.0.0" "isaacsim_rl-4.5.0.0"
-                "isaacsim_robot_setup-4.5.0.0" "isaacsim_ros2-4.5.0.0" "isaacsim_template-4.5.0.0"
-                "isaacsim_test-4.5.0.0" "isaacsim-4.5.0.0" "isaacsim_extscache_physics-4.5.0.0"
-                "isaacsim_extscache_kit-4.5.0.0" "isaacsim_extscache_kit_sdk-4.5.0.0"
-            )
-            
-            local wheel_files=()
-            for pkg in "${packages[@]}"; do
-                local pkg_name=${pkg%-*}
-                local filename="${pkg}-cp310-none-manylinux_2_34_x86_64.whl"
-                local url="https://pypi.nvidia.com/${pkg_name//_/-}/$filename"
-                local filepath="$temp_dir/$filename"
-                
-                echo "Downloading $pkg..."
-                if ! curl -sL "$url" -o "$filepath"; then
-                    echo "ERROR: Failed to download $pkg"
-                    rm -rf "$temp_dir"
+
+        # For aarch, do alternative install via direct one-liner
+        if [ "$ARCH" = "aarch64" ]; then
+            run_pip install isaacsim[all,extscache]==5.1.0 --extra-index-url "$NVIDIA_INDEX"
+        else
+            # Helper functions
+            check_glibc_old() {
+                ldd --version 2>&1 | grep -qE "2\.(31|32|33|34)"
+            }
+
+            install_isaac_packages() {
+                local temp_dir=$(mktemp -d)
+                local packages=(
+                    "omniverse_kit-107.3.1.206797"
+                    "isaacsim_kernel-5.1.0.0"
+                    "isaacsim_app-5.1.0.0"
+                    "isaacsim_core-5.1.0.0"
+                    "isaacsim_gui-5.1.0.0"
+                    "isaacsim_utils-5.1.0.0"
+                    "isaacsim_storage-5.1.0.0"
+                    "isaacsim_asset-5.1.0.0"
+                    "isaacsim_sensor-5.1.0.0"
+                    "isaacsim_robot_motion-5.1.0.0"
+                    "isaacsim_robot-5.1.0.0"
+                    "isaacsim_benchmark-5.1.0.0"
+                    "isaacsim_code_editor-5.1.0.0"
+                    "isaacsim_ros1-5.1.0.0"
+                    "isaacsim_cortex-5.1.0.0"
+                    "isaacsim_example-5.1.0.0"
+                    "isaacsim_replicator-5.1.0.0"
+                    "isaacsim_rl-5.1.0.0"
+                    "isaacsim_robot_setup-5.1.0.0"
+                    "isaacsim_ros2-5.1.0.0"
+                    "isaacsim_template-5.1.0.0"
+                    "isaacsim_test-5.1.0.0"
+                    "isaacsim-5.1.0.0"
+                    "isaacsim_extscache_physics-5.1.0.0"
+                    "isaacsim_extscache_kit-5.1.0.0"
+                    "isaacsim_extscache_kit_sdk-5.1.0.0"
+                )
+
+                # --fail keeps an HTTP error page from being saved under a .whl name;
+                # --speed-limit/--speed-time abort a transfer that stalls without erroring.
+                local curl_opts=(-sS --location --fail --connect-timeout 30 --speed-limit 1024 --speed-time 60)
+
+                local wheel_files=()
+                for pkg in "${packages[@]}"; do
+                    local pkg_name=${pkg%-*}
+                    local filename="${pkg}-cp311-none-manylinux_2_35_${ARCH}.whl"
+                    local url="${NVIDIA_INDEX%/}/${pkg_name//_/-}/$filename"
+                    local filepath="$temp_dir/$filename"
+                    local attempt
+
+                    if [ -n "$ISAAC_SIM_WHEEL_PATH" ]; then
+                        if [ ! -f "$ISAAC_SIM_WHEEL_PATH/$filename" ]; then
+                            echo "ERROR: Missing Isaac Sim wheel: $ISAAC_SIM_WHEEL_PATH/$filename"
+                            rm -rf "$temp_dir"
+                            return 1
+                        fi
+                        # Link into the temporary directory so retagging never changes the cached wheel.
+                        if ! ln -s "$(cd "$ISAAC_SIM_WHEEL_PATH" && pwd)/$filename" "$filepath"; then
+                            rm -rf "$temp_dir"
+                            return 1
+                        fi
+                    else
+                        echo "Downloading $pkg..."
+                        for attempt in 1 2 3 4 5; do
+                            if curl "${curl_opts[@]}" "$url" -o "$filepath"; then
+                                break
+                            fi
+                            if [ "$attempt" -eq 5 ]; then
+                                echo "ERROR: Failed to download $pkg"
+                                rm -rf "$temp_dir"
+                                return 1
+                            fi
+                            echo "Retrying $pkg ($attempt/5)..."
+                            sleep 5
+                        done
+                    fi
+
+                    # Rename for older GLIBC
+                    if check_glibc_old; then
+                        local new_filepath="${filepath/manylinux_2_35/manylinux_2_31}"
+                        mv "$filepath" "$new_filepath"
+                        filepath="$new_filepath"
+                    fi
+
+                    wheel_files+=("$filepath")
+                done
+
+                echo "Installing Isaac Sim packages..."
+                run_pip install "${wheel_files[@]}"
+                rm -rf "$temp_dir"
+
+                # Verify installation
+                if ! python -c "import isaacsim" 2>/dev/null; then
+                    echo "ERROR: Isaac Sim installation verification failed"
                     return 1
                 fi
-                
-                # Rename for older GLIBC
-                if check_glibc_old; then
-                    local new_filepath="${filepath/manylinux_2_34/manylinux_2_31}"
-                    mv "$filepath" "$new_filepath"
-                    filepath="$new_filepath"
-                fi
-                
-                wheel_files+=("$filepath")
-            done
-            
-            echo "Installing Isaac Sim packages..."
-            pip install "${wheel_files[@]}"
-            rm -rf "$temp_dir"
-            
-            # Verify installation
-            if ! python -c "import isaacsim" 2>/dev/null; then
-                echo "ERROR: Isaac Sim installation verification failed"
-                return 1
-            fi
-        }
+            }
+
+            install_isaac_packages || { echo "ERROR: Isaac Sim installation failed"; exit 1; }
+        fi
         
-        install_isaac_packages || { echo "ERROR: Isaac Sim installation failed"; exit 1; }
-        
-        # Fix cryptography conflict - remove conflicting version
-        if [ -n "$ISAAC_PATH" ] && [ -d "$ISAAC_PATH/exts/omni.pip.cloud/pip_prebundle/cryptography" ]; then
-            echo "Fixing cryptography conflict..."
-            rm -rf "$ISAAC_PATH/exts/omni.pip.cloud/pip_prebundle/cryptography"
+        # Extract ISAAC_PATH from isaacsim module
+        ISAAC_PATH=$(python -c "import isaacsim, os; print(os.environ.get('ISAAC_PATH', ''))" 2>/dev/null)
+
+        # Fix websockets conflict - remove any pip_prebundle/websockets under extscache
+        if [ -n "$ISAAC_PATH" ] && [ -d "$ISAAC_PATH/extscache" ]; then
+            echo "Fixing websockets conflict..."
+            find "$ISAAC_PATH/extscache" -type d -name "websockets" -path "*/pip_prebundle/*" -exec rm -rf {} + 2>/dev/null || true
+        fi
+
+        # Fix packaging conflict - remove conflicting version
+        # There is a conflict where isaacsim enforces 23.0 but omni kit ships with 25.0
+        if [ -d "$CONDA_PREFIX/lib/python3.11/site-packages/isaacsim/extscache/omni.services.pip_archive-0.16.0+107.0.3.lx64.cp311/pip_prebundle/packaging" ]; then
+            echo "Fixing packaging conflict..."
+            rm -rf "$CONDA_PREFIX/lib/python3.11/site-packages/isaacsim/extscache/omni.services.pip_archive-0.16.0+107.0.3.lx64.cp311/pip_prebundle/packaging"
         fi
     fi
     
+    # Force reinstall cffi 1.17.1 to resolve compatibility issues with Isaac Sim extensions
+    run_pip install --force-reinstall cffi==1.17.1
+    # Force reinstall websockets >= 15.0.1 because it's been overwritten by Isaac Sim with an older version
+    run_pip install --force-reinstall "websockets>=15.0.1"
+
     echo "OmniGibson installation completed successfully!"
 fi
 
@@ -365,23 +495,21 @@ fi
 if [ "$JOYLO" = true ]; then
     echo "Installing JoyLo..."
     [ ! -d "joylo" ] && { echo "ERROR: joylo directory not found"; exit 1; }
-    pip install -e "$WORKDIR/joylo"
+    run_pip install -e "$WORKDIR/joylo"
 fi
 
 # Install Eval
 if [ "$EVAL" = true ]; then
     # get torch version via pip and install corresponding torch-cluster
-    TORCH_VERSION=$(pip show torch | grep Version | cut -d " " -f 2)
-    pip install torch-cluster -f https://data.pyg.org/whl/torch-${TORCH_VERSION}.html
-    # install av and ffmpeg
-    conda install av "numpy<2" -c conda-forge -y
+    TORCH_VERSION=$(run_pip show torch | grep Version | cut -d " " -f 2)
+    run_pip install torch-cluster -f https://data.pyg.org/whl/torch-${TORCH_VERSION}.html
 fi
-    
+
 # Install asset pipeline
 if [ "$ASSET_PIPELINE" = true ]; then
     echo "Installing asset pipeline..."
     [ ! -d "asset_pipeline" ] && { echo "ERROR: asset_pipeline directory not found"; exit 1; }
-    pip install -r "$WORKDIR/asset_pipeline/requirements.txt"
+    run_pip install -r "$WORKDIR/asset_pipeline/requirements.txt"
 fi
 
 # Install datasets
@@ -390,9 +518,9 @@ if [ "$DATASET" = true ]; then
         echo "ERROR: OmniGibson import failed, please make sure you have omnigibson installed before downloading datasets"
         exit 1
     }
-    
+
     echo "Installing datasets..."
-    
+
     # Determine if we should accept dataset license automatically
     DATASET_ACCEPT_FLAG=""
     if [ "$ACCEPT_DATASET_TOS" = true ]; then
@@ -415,16 +543,16 @@ if [ "$DATASET" = true ]; then
         exit 1
     }
 
-    echo "Downloading 2025 BEHAVIOR Challenge Task Instances..."
-    python -c "from omnigibson.utils.asset_utils import download_2025_challenge_task_instances; download_2025_challenge_task_instances()" || {
-        echo "ERROR: 2025 BEHAVIOR Challenge Task Instances installation failed"
+    echo "Downloading 2026 BEHAVIOR Challenge Task Instances..."
+    python -c "from omnigibson.utils.asset_utils import download_2026_challenge_task_instances; download_2026_challenge_task_instances()" || {
+        echo "ERROR: 2026 BEHAVIOR Challenge Task Instances installation failed"
         exit 1
     }
 fi
 
 echo ""
 echo "=== Installation Complete! ==="
-if [ "$NEW_ENV" = true ]; then echo "✓ Created conda environment 'behavior'"; fi
+if [ "$NEW_ENV" = true ]; then echo "✓ Created conda environment '$NEW_ENV_NAME'"; fi
 if [ "$OMNIGIBSON" = true ]; then echo "✓ Installed OmniGibson + Isaac Sim"; fi
 if [ "$BDDL" = true ]; then echo "✓ Installed BDDL"; fi
 if [ "$JOYLO" = true ]; then echo "✓ Installed JoyLo"; fi
@@ -432,4 +560,4 @@ if [ "$PRIMITIVES" = true ]; then echo "✓ Installed OmniGibson with primitives
 if [ "$EVAL" = true ]; then echo "✓ Installed evaluation support"; fi
 if [ "$DATASET" = true ]; then echo "✓ Downloaded datasets"; fi
 echo ""
-if [ "$NEW_ENV" = true ]; then echo "To activate: conda activate behavior"; fi
+if [ "$NEW_ENV" = true ]; then echo "To activate: conda activate '$NEW_ENV_NAME'"; fi

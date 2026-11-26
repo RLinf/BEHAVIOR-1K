@@ -4,6 +4,7 @@ import torch as th
 
 import omnigibson as og
 import omnigibson.lazy as lazy
+from omnigibson.macros import gm
 from omnigibson.sensors.sensor_base import BaseSensor
 from omnigibson.systems.system_base import get_all_system_names
 from omnigibson.utils.constants import (
@@ -15,22 +16,11 @@ from omnigibson.utils.constants import (
 )
 from omnigibson.utils.numpy_utils import NumpyTypes
 from omnigibson.utils.python_utils import assert_valid_key, classproperty
-from omnigibson.utils.sim_utils import set_carb_setting
 from omnigibson.utils.ui_utils import create_module_logger, dock_window
 from omnigibson.utils.vision_utils import Remapper
 
 # Create module logger
 log = create_module_logger(module_name=__name__)
-
-
-# Duplicate of simulator's render method, used so that this can be done before simulator is created!
-def render():
-    """
-    Refreshes the Isaac Sim app rendering components including UI elements and view ports..etc.
-    """
-    set_carb_setting(og.app._carb_settings, "/app/player/playSimulations", False)
-    og.app.update()
-    set_carb_setting(og.app._carb_settings, "/app/player/playSimulations", True)
 
 
 class VisionSensor(BaseSensor):
@@ -66,7 +56,7 @@ class VisionSensor(BaseSensor):
         horizontal_aperture (float): Horizontal aperture to set
         clipping_range (2-tuple): (min, max) viewing range of this vision sensor
         viewport_name (None or str): If specified, will link this camera to the specified viewport, overriding its
-            current camera. Otherwise, creates a new viewport
+            current camera. Otherwise, creates a new viewport if not in headless mode and links this camera to it.
     """
 
     ALL_MODALITIES = (
@@ -83,6 +73,25 @@ class VisionSensor(BaseSensor):
         "bbox_3d",
         "camera_params",
         "pointcloud",
+    )
+
+    RAW_SENSOR_TYPES = dict(
+        rgb="rgb",
+        depth="distance_to_camera",
+        depth_linear="distance_to_image_plane",
+        normal="normals",
+        # Semantic segmentation shows the category each pixel belongs to
+        seg_semantic="semantic_segmentation",
+        # Instance segmentation shows the name of the object each pixel belongs to
+        seg_instance="instance_segmentation",
+        # Instance ID segmentation shows the prim path of the visual mesh each pixel belongs to
+        seg_instance_id="instance_id_segmentation",
+        flow="motion_vectors",
+        bbox_2d_tight="bounding_box_2d_tight",
+        bbox_2d_loose="bounding_box_2d_loose",
+        bbox_3d="bounding_box_3d",
+        camera_params="camera_params",
+        pointcloud="pointcloud",
     )
 
     # Documentation for the different types of segmentation for particle systems:
@@ -148,29 +157,12 @@ class VisionSensor(BaseSensor):
         self._viewport = None  # Viewport from which to grab data
         self._annotators = None
         self._render_product = None
+        self._image_height = image_height  # used when viewport is not created
+        self._image_width = image_width  # used when viewport is not created
 
-        self._RAW_SENSOR_TYPES = dict(
-            rgb="rgb",
-            depth="distance_to_camera",
-            depth_linear="distance_to_image_plane",
-            normal="normals",
-            # Semantic segmentation shows the category each pixel belongs to
-            seg_semantic="semantic_segmentation",
-            # Instance segmentation shows the name of the object each pixel belongs to
-            seg_instance="instance_segmentation",
-            # Instance ID segmentation shows the prim path of the visual mesh each pixel belongs to
-            seg_instance_id="instance_id_segmentation",
-            flow="motion_vectors",
-            bbox_2d_tight="bounding_box_2d_tight",
-            bbox_2d_loose="bounding_box_2d_loose",
-            bbox_3d="bounding_box_3d",
-            camera_params="camera_params",
-            pointcloud="pointcloud",
-        )
-
-        assert {key for key in self._RAW_SENSOR_TYPES.keys() if key != "camera_params"} == set(
+        assert {key for key in self.raw_sensor_types.keys() if key != "camera_params"} == set(
             self.all_modalities
-        ), "VisionSensor._RAW_SENSOR_TYPES must have the same keys as VisionSensor.all_modalities!"
+        ), "VisionSensor.RAW_SENSOR_TYPES must have the same keys as VisionSensor.ALL_MODALITIES!"
 
         if modalities == "all":
             modalities = self.all_modalities
@@ -197,9 +189,10 @@ class VisionSensor(BaseSensor):
     def _load(self):
         # Define a new camera prim at the current stage
         # Note that we can't use og.sim.stage here because the vision sensors get loaded first
-        return lazy.pxr.UsdGeom.Camera.Define(
-            lazy.isaacsim.core.utils.stage.get_current_stage(), self.prim_path
-        ).GetPrim()
+        with og.sim.editing_usd():
+            return lazy.pxr.UsdGeom.Camera.Define(
+                lazy.isaacsim.core.utils.stage.get_current_stage(), self.prim_path
+            ).GetPrim()
 
     def _post_load(self):
         # run super first
@@ -209,18 +202,23 @@ class VisionSensor(BaseSensor):
         self.SENSORS[self.prim_path] = self
 
         resolution = (self._load_config["image_width"], self._load_config["image_height"])
-        self._render_product = lazy.omni.replicator.core.create.render_product(self.prim_path, resolution)
+        self._image_width, self._image_height = resolution
+        with og.sim.editing_usd():
+            self._render_product = lazy.omni.replicator.core.create.render_product(self.prim_path, resolution)
 
         # Create a new viewport to link to this camera or link to a pre-existing one
         viewport_name = self._load_config["viewport_name"]
-        if viewport_name is not None:
+        should_create_viewport = viewport_name is not None or (not gm.HEADLESS and gm.RENDER_VIEWER_CAMERA)
+        viewport = None
+        if should_create_viewport and viewport_name is not None:
             vp_names_to_handles = {vp.name: vp for vp in lazy.omni.kit.viewport.window.get_viewport_window_instances()}
             assert_valid_key(key=viewport_name, valid_keys=vp_names_to_handles, name="viewport name")
             viewport = vp_names_to_handles[viewport_name]
-        else:
-            viewport = lazy.omni.kit.viewport.utility.create_viewport_window()
+        elif should_create_viewport:
+            with og.sim.editing_usd():
+                viewport = lazy.omni.kit.viewport.utility.create_viewport_window()
             # Take a render step to make sure the viewport is generated before docking it
-            render()
+            og.sim.render()
             # Grab the newly created viewport and dock it to the GUI
             # The first viewport is always the "main" global camera, and any additional cameras are auxiliary views
             # These auxiliary views will be stacked in a single column
@@ -247,16 +245,16 @@ class VisionSensor(BaseSensor):
                     )
 
         self._viewport = viewport
+        if self._viewport is not None:
+            # Link the camera and viewport together
+            self._viewport.viewport_api.set_active_camera(self.prim_path)
 
-        # Link the camera and viewport together
-        self._viewport.viewport_api.set_active_camera(self.prim_path)
+            # Requires 4 render updates to propagate changes
+            for i in range(4):
+                og.sim.render()
 
-        # Requires 3 render updates to propagate changes
-        for i in range(3):
-            render()
-
-        # Set the viewer size (requires taking one render step afterwards)
-        self._viewport.viewport_api.set_texture_resolution(resolution)
+            # Set the viewer size (requires taking one render step afterwards)
+            self._viewport.viewport_api.set_texture_resolution(resolution)
 
         # Also update relevant camera params from load config
         self.focal_length = self._load_config["focal_length"]
@@ -265,9 +263,9 @@ class VisionSensor(BaseSensor):
         self.horizontal_aperture = self._load_config["horizontal_aperture"]
         self.clipping_range = self._load_config["clipping_range"]
 
-        # Requires 3 render updates to propagate changes
-        for i in range(3):
-            render()
+        # Requires 4 render updates to propagate changes
+        for i in range(4):
+            og.sim.render()
 
     def _initialize(self):
         # Run super first
@@ -277,15 +275,15 @@ class VisionSensor(BaseSensor):
 
         # Initialize sensors
         self.initialize_sensors(names=self._modalities)
-        for _ in range(3):
-            render()
+        for _ in range(4):
+            og.sim.render()
 
     def initialize_sensors(self, names):
         """Initializes a raw sensor in the simulation.
 
         Args:
             names (str or list of str): Name of the raw sensor(s) to initialize.
-                If they are not part of self._RAW_SENSOR_TYPES' keys, we will simply pass over them
+                If they are not part of self.raw_sensor_types' keys, we will simply pass over them
         """
         names = {names} if isinstance(names, str) else set(names)
         for name in names:
@@ -589,10 +587,11 @@ class VisionSensor(BaseSensor):
             modality (str): Name of the modality to add to the Replicator backend
         """
         if self._annotators.get(modality, None) is None:
-            self._annotators[modality] = lazy.omni.replicator.core.AnnotatorRegistry.get_annotator(
-                self._RAW_SENSOR_TYPES[modality]
-            )
-            self._annotators[modality].attach([self._render_product])
+            with og.sim.editing_usd():
+                self._annotators[modality] = lazy.omni.replicator.core.AnnotatorRegistry.get_annotator(
+                    self.raw_sensor_types[modality]
+                )
+                self._annotators[modality].attach([self._render_product])
 
     def _remove_modality_from_backend(self, modality):
         """
@@ -604,26 +603,38 @@ class VisionSensor(BaseSensor):
         if self._annotators.get(modality, None) is not None:
             # Passing an explicit list is bugged -- see omni source code
             # So we only pass in the product directly, which gets post-processed correctly
-            self._annotators[modality].detach(self._render_product)
+            with og.sim.editing_usd():
+                try:
+                    self._annotators[modality].detach(self._render_product)
+                except TypeError:
+                    # omni.syntheticdata's node deactivation walk is fragile once a tiled render product
+                    # has existed in the session: cached graph node handles become invalid and detach raises
+                    # "Invalid NodeObj object". The annotator's nodes are already gone at that point, so we
+                    # just drop our reference (teardown-only; nothing further to clean up)
+                    log.warning(f"Failed to cleanly detach annotator for modality {modality}; skipping")
             self._annotators[modality] = None
 
     def remove(self):
         # Remove from global sensors dictionary
-        self.SENSORS.pop(self.prim_path)
+        self.SENSORS.pop(self.prim_path, None)
 
         # Remove all modalities
         for modality in tuple(self.modalities):
             self.remove_modality(modality)
 
         # Destroy the render product
-        self._render_product.destroy()
+        with og.sim.editing_usd():
+            self._render_product.destroy()
 
-        # Remove the viewport if it's not the main viewport
-        if self._viewport.name != "Viewport":
-            self._viewport.destroy()
-        else:
-            # We're deleting our camera, so set the normal viewport camera to the default /Perspective camera
-            self.active_camera_path = "/OmniverseKit_Persp"
+        # Remove the viewport if it exists.
+        if self._viewport is not None:
+            # Remove the viewport if it's not the main viewport
+            if self._viewport.name != "Viewport":
+                with og.sim.editing_usd():
+                    self._viewport.destroy()
+            else:
+                # We're deleting our camera, so set the normal viewport camera to the default /Perspective camera
+                self.active_camera_path = "/OmniverseKit_Persp"
 
         # Run super
         super().remove()
@@ -667,9 +678,9 @@ class VisionSensor(BaseSensor):
         # Add the camera params modality if it doesn't already exist
         if "camera_params" not in self._annotators:
             self.initialize_sensors(names="camera_params")
-            # Requires 3 render updates for camera params annotator to become active
-            for _ in range(3):
-                render()
+            # Requires 4 render updates for camera params annotator to become active
+            for _ in range(4):
+                og.sim.render()
         # Grab and return the parameters
         return self._annotators["camera_params"].get_data()
 
@@ -679,7 +690,7 @@ class VisionSensor(BaseSensor):
         Returns:
             bool: Whether the viewer is visible or not
         """
-        return self._viewport.visible
+        return False if self._viewport is None else self._viewport.visible
 
     @viewer_visibility.setter
     def viewer_visibility(self, visible):
@@ -689,9 +700,11 @@ class VisionSensor(BaseSensor):
         Args:
             visible (bool): Whether the viewer should be visible or not
         """
+        if self._viewport is None:
+            return
         self._viewport.visible = visible
         # Requires 1 render update to propagate changes
-        render()
+        og.sim.render()
 
     @property
     def image_height(self):
@@ -699,7 +712,7 @@ class VisionSensor(BaseSensor):
         Returns:
             int: Image height of this sensor, in pixels
         """
-        return self._viewport.viewport_api.get_texture_resolution()[1]
+        return self._image_height if self._viewport is None else self._viewport.viewport_api.get_texture_resolution()[1]
 
     @image_height.setter
     def image_height(self, height):
@@ -709,24 +722,30 @@ class VisionSensor(BaseSensor):
         Args:
             height (int): Image height of this sensor, in pixels
         """
-        width, _ = self._viewport.viewport_api.get_texture_resolution()
-        self._viewport.viewport_api.set_texture_resolution((width, height))
+        self._image_height = height
+        width = self._image_width
+        if self._viewport is not None:
+            width, _ = self._viewport.viewport_api.get_texture_resolution()
+            self._viewport.viewport_api.set_texture_resolution((width, height))
 
         # Also update render product and update all annotators
-        for annotator in self._annotators.values():
-            annotator.detach([self._render_product.path])
+        with og.sim.editing_usd():
+            for annotator in self._annotators.values():
+                if annotator is not None:
+                    annotator.detach([self._render_product.path])
 
-        self._render_product.destroy()
-        self._render_product = lazy.omni.replicator.core.create.render_product(
-            self.prim_path, (width, height), force_new=True
-        )
+            self._render_product.destroy()
+            self._render_product = lazy.omni.replicator.core.create.render_product(
+                self.prim_path, (width, height), force_new=True
+            )
 
-        for annotator in self._annotators.values():
-            annotator.attach([self._render_product])
+            for annotator in self._annotators.values():
+                if annotator is not None:
+                    annotator.attach([self._render_product])
 
-        # Requires 3 updates to propagate changes
-        for i in range(3):
-            render()
+        # Requires 4 updates to propagate changes
+        for i in range(4):
+            og.sim.render()
 
     @property
     def image_width(self):
@@ -734,7 +753,7 @@ class VisionSensor(BaseSensor):
         Returns:
             int: Image width of this sensor, in pixels
         """
-        return self._viewport.viewport_api.get_texture_resolution()[0]
+        return self._image_width if self._viewport is None else self._viewport.viewport_api.get_texture_resolution()[0]
 
     @image_width.setter
     def image_width(self, width):
@@ -744,24 +763,30 @@ class VisionSensor(BaseSensor):
         Args:
             width (int): Image width of this sensor, in pixels
         """
-        _, height = self._viewport.viewport_api.get_texture_resolution()
-        self._viewport.viewport_api.set_texture_resolution((width, height))
+        self._image_width = width
+        height = self._image_height
+        if self._viewport is not None:
+            _, height = self._viewport.viewport_api.get_texture_resolution()
+            self._viewport.viewport_api.set_texture_resolution((width, height))
 
         # Also update render product and update all annotators
-        for annotator in self._annotators.values():
-            annotator.detach([self._render_product.path])
+        with og.sim.editing_usd():
+            for annotator in self._annotators.values():
+                if annotator is not None:
+                    annotator.detach([self._render_product.path])
 
-        self._render_product.destroy()
-        self._render_product = lazy.omni.replicator.core.create.render_product(
-            self.prim_path, (width, height), force_new=True
-        )
+            self._render_product.destroy()
+            self._render_product = lazy.omni.replicator.core.create.render_product(
+                self.prim_path, (width, height), force_new=True
+            )
 
-        for annotator in self._annotators.values():
-            annotator.attach([self._render_product])
+            for annotator in self._annotators.values():
+                if annotator is not None:
+                    annotator.attach([self._render_product])
 
-        # Requires 3 updates to propagate changes
-        for i in range(3):
-            render()
+        # Requires 4 updates to propagate changes
+        for i in range(4):
+            og.sim.render()
 
     @property
     def clipping_range(self):
@@ -783,7 +808,7 @@ class VisionSensor(BaseSensor):
         # In order for sensor changes to propagate, we must toggle its visibility
         self.visible = False
         # A single update step has to happen here before we toggle visibility for changes to propagate
-        render()
+        og.sim.render()
         self.visible = True
 
     @property
@@ -864,7 +889,7 @@ class VisionSensor(BaseSensor):
         Returns:
             str: prim path of the active camera attached to this vision sensor
         """
-        return self._viewport.viewport_api.get_active_camera().pathString
+        return None if self._viewport is None else self._viewport.viewport_api.get_active_camera().pathString
 
     @active_camera_path.setter
     def active_camera_path(self, path):
@@ -874,10 +899,15 @@ class VisionSensor(BaseSensor):
         Args:
             path (str): Prim path to the camera that will be attached to this vision sensor
         """
+        if self._viewport is None:
+            raise RuntimeError(
+                "Cannot set active_camera_path because this sensor has no viewport. "
+                "Set gm.HEADLESS=False and gm.RENDER_VIEWER_CAMERA=True to enable viewport textures."
+            )
         self._viewport.viewport_api.set_active_camera(path)
         # Requires 6 updates to propagate changes
         for i in range(6):
-            render()
+            og.sim.render()
 
     @property
     def intrinsic_matrix(self):
@@ -893,6 +923,12 @@ class VisionSensor(BaseSensor):
         cx = (1.0 - P[0, 2]) * width / 2.0
         cy = (1.0 - P[1, 2]) * height / 2.0
         K = th.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+
+        # Explicitly sanity check for null values here
+        degen_mat = th.zeros(3, 3)
+        degen_mat[2, 2] = 1.0
+        assert not th.all(K == degen_mat).item(), f"intrinsic matrix for sensor: {self.name} is degenerate!"
+
         return K
 
     @property
@@ -957,7 +993,7 @@ class VisionSensor(BaseSensor):
             sensor.remove()
 
         # Render to update
-        render()
+        og.sim.render()
 
         cls.SEMANTIC_REMAPPER = Remapper()
         cls.INSTANCE_REMAPPER = Remapper()
@@ -971,6 +1007,10 @@ class VisionSensor(BaseSensor):
     @classproperty
     def all_modalities(cls):
         return {modality for modality in cls.ALL_MODALITIES if modality != "camera_params"}
+
+    @classproperty
+    def raw_sensor_types(cls):
+        return cls.RAW_SENSOR_TYPES.copy()
 
     @classproperty
     def no_noise_modalities(cls):

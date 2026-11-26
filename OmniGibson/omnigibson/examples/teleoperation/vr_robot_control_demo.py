@@ -8,7 +8,6 @@ from omnigibson.utils.teleop_utils import OVXRSystem
 
 gm.ENABLE_OBJECT_STATES = False
 gm.ENABLE_TRANSITION_RULES = False
-gm.ENABLE_FLATCACHE = True
 
 CONTROLLER_VISIBLE = True
 ENABLE_CAMERA_LIMITS = False
@@ -76,7 +75,7 @@ def main():
     env.reset()
     # start vrsys
     vrsys = OVXRSystem(
-        robot=env.robots[0],
+        robot=env.scene.robots[0],
         show_control_marker=CONTROLLER_VISIBLE,
         system="SteamVR",
         eef_tracking_mode="controller",

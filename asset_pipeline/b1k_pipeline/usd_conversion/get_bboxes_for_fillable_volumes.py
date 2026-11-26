@@ -28,12 +28,13 @@ import fs.path
 gm.HEADLESS = False
 gm.USE_ENCRYPTED_ASSETS = True
 gm.ENABLE_TRANSITION_RULES = False
-gm.ENABLE_FLATCACHE = False
 gm.DATASET_PATH = r"D:\fillable-10-21"
 
 BATCH_SIZE = 100
 
-META_PATTERN = re.compile('(particlesink|lights|particlesource|togglebutton|heatsource|attachment)_.*_.*_link')
+META_PATTERN = re.compile(
+    "(particlesink|lights|particlesource|togglebutton|heatsource|attachment)_.*_.*_link"
+)
 
 
 def view_object(cat, mdl):
@@ -62,7 +63,7 @@ def view_object(cat, mdl):
                 "kinematic_only": False,
                 "fixed_base": True,
             },
-        ]
+        ],
     }
 
     env = og.Environment(configs=cfg)
@@ -86,10 +87,18 @@ def view_object(cat, mdl):
     base_pos = fillable.get_position_orientation()[0].numpy().tolist()
     base_orn = fillable.get_position_orientation()[1].numpy().tolist()
 
-    data = {"bbox_center": bbox_center, "bbox_extents": bbox_extents, "base_pos": base_pos, "base_orn": base_orn}
-    target_path = pathlib.Path(DatasetObject.get_usd_path(cat, mdl)).parent.parent / "bbox.json"
+    data = {
+        "bbox_center": bbox_center,
+        "bbox_extents": bbox_extents,
+        "base_pos": base_pos,
+        "base_orn": base_orn,
+    }
+    target_path = (
+        pathlib.Path(DatasetObject.get_usd_path(cat, mdl)).parent.parent / "bbox.json"
+    )
     with open(target_path, "w") as f:
         json.dump(data, f)
+
 
 def main():
     print("Fillable annotator version 11.6.0")
@@ -102,7 +111,9 @@ def main():
     random.shuffle(fillables)
 
     for cat, mdl in tqdm.tqdm(fillables[:BATCH_SIZE]):
-        if not os.path.exists(DatasetObject.get_usd_path(cat, mdl).replace(".usd", ".encrypted.usd")):
+        if not os.path.exists(
+            DatasetObject.get_usd_path(cat, mdl).replace(".usd", ".encrypted.usd")
+        ):
             print(f"Skipping {cat}/{mdl} because it does not exist")
             continue
         view_object(cat, mdl)

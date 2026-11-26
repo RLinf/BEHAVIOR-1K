@@ -17,6 +17,8 @@ class Timeout(FailureCondition):
         # Run super
         super().__init__()
 
-    def _step(self, task, env, action):
+    def _step(self, task, env, action, env_indices=None):
         # Terminate if number of steps passed exceeds threshold
-        return env.episode_steps >= self._max_steps
+        # env.episode_steps is (num_envs,) tensor
+        steps = env.episode_steps if env_indices is None else env.episode_steps[env_indices]
+        return steps >= self._max_steps

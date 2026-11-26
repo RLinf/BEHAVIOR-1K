@@ -1,4 +1,6 @@
-from omnigibson.object_states.contact_bodies import ContactBodies
+import torch as th
+
+from omnigibson.utils.usd_utils import RigidContactAPI
 from omnigibson.reward_functions.reward_function_base import BaseRewardFunction
 
 
@@ -25,14 +27,18 @@ class CollisionReward(BaseRewardFunction):
         # Run super
         super().__init__()
 
-    def _step(self, task, env, action):
+    def _step(self, task, env, action, env_indices=None):
         # Penalty is Reward is -self._r_collision if there were any collisions in the last timestep
-        robot = env.robots[self._robot_idn]
-        # Ignore floors and potentially robot's own prims as well
-        floors = list(env.scene.object_registry("category", "floors", []))
-        ignore_objs = floors if self._ignore_self_collisions is None else floors + [robot]
-        in_contact = (
-            len(env.robots[self._robot_idn].states[ContactBodies].get_value(ignore_objs=tuple(ignore_objs))) > 0
-        )
-        reward = float(in_contact) * -self._r_collision
-        return reward, {}
+        indices = range(env.num_envs) if env_indices is None else env_indices
+        rewards = th.zeros(len(indices), dtype=th.float32)
+        infos = [dict() for _ in indices]
+        for row, env_idx in enumerate(indices):
+            robot = env.scenes[env_idx].robots[self._robot_idn]
+            # Ignore floors and potentially robot's own prims as well
+            floors = list(env.scenes[env_idx].object_registry("category", "floors", []))
+            ignore_objs = floors + [robot] if self._ignore_self_collisions else floors
+            in_contact = RigidContactAPI.is_in_contact(
+                scene_idx=robot.scene.idx, query_set=[robot], with_set=None, ignore_set=ignore_objs, current_only=False
+            )
+            rewards[row] = float(in_contact) * -self._r_collision
+        return rewards, infos

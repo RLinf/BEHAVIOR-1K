@@ -35,6 +35,7 @@ IMG_SIZE = 1024
 HQ_IMG_SIZE = 4096
 HQ_IMG_CATEGORIES = {"floors", "lawn", "driveway", "walls"}
 NEW_UV_CHANNEL = 99
+USE_NATIVE_UNWRAPPING_ON_ERROR = True
 
 # PBRMetalRough
 # CHANNEL_MAPPING = {
@@ -64,7 +65,9 @@ CHANNEL_DATA_FORMAT_OVERRIDES = {
 # }
 
 RENDER_PRESET_FILENAME = str(
-    (b1k_pipeline.utils.PIPELINE_ROOT / "render_presets" / "no_sampler_no_gi.rps").absolute()
+    (
+        b1k_pipeline.utils.PIPELINE_ROOT / "render_presets" / "no_sampler_no_gi.rps"
+    ).absolute()
 )
 
 allow_list = []
@@ -160,7 +163,8 @@ class TextureBaker:
 
     def get_process_objs(self):
         objs = []
-        for obj in (rt.objects if not rt.selection else rt.selection):
+        candidates = rt.objects if len(rt.selection) == 0 else rt.selection
+        for obj in candidates:
             if rt.classOf(obj) != rt.Editable_Poly:
                 continue
             if allow_list and all(
@@ -188,27 +192,30 @@ class TextureBaker:
     def uv_unwrapping_unwrella(self, obj):
         u = rt.Unwrella()
         rt.addmodifier(obj, u)
-        u.stretch = 0.15
+        u.stretch = 1  # We allow for any amount of stretching. This was originally 0.15.
         u.rescale = True
+        u.combine = False
         u.prerotate = True
-        u.packmode = 1  # Efficient
+        u.packmode = 0  # Classic. Go 1 for Efficient and 2 for High Quality.
         u.map_channel = NEW_UV_CHANNEL
         u.keep_seams = False
-        u.unwrap_mode = 0
+        u.unwrap_mode = 1  # 0 for organic. 1 is for hard-edge objects which most of ours are.
 
         u.padding = 2
         u.width = 1024
         u.height = 1024
         u.preview = False
 
-        assert u.unwrap(), f"Unwrapping error w/ {obj.name}: {u.error}"
+        rt.modPanel.setCurrentObject(u)
+        rt.completeRedraw()
+        rt.windows.processPostedMessages()
+        time.sleep(3)
+
+        u.unwrap()
+        time.sleep(3)
+        assert u.success, f"Unwrapping error w/ {obj.name}: {u.error}"
 
     def uv_unwrapping_native(self, obj):
-        rt.select(obj)
-
-        # Select all faces in preparation for uv unwrap
-        rt.polyop.setFaceSelection(obj, rt.name("all"))
-
         modifier = rt.unwrap_uvw()
         rt.addmodifier(obj, modifier)
 
@@ -219,11 +226,16 @@ class TextureBaker:
         modifier.unwrap2.flattenMapNoParams()
 
     def uv_unwrapping(self, obj):
+        rt.select(obj)
+
+        # Select all faces in preparation for uv unwrap
+        rt.polyop.setFaceSelection(obj, rt.name("all"))
+
         # Check if the object is already unwrapped with the same geometry
         current_hash = hash_object(obj)
         recorded_hash = get_recorded_uv_unwrapping_hash(obj)
         if rt.polyop.getMapSupport(obj, 99) and recorded_hash == current_hash:
-            print(f"Skipping unwrapping for {obj.name} as it has not changed.")
+            # print(f"Skipping unwrapping for {obj.name} as it has not changed.")
             return
 
         start_time = time.time()
@@ -231,15 +243,28 @@ class TextureBaker:
         print("uv_unwrapping", obj.name)
 
         rt.polyop.setMapSupport(obj, 99, False)
-        assert not rt.polyop.getMapSupport(obj, 99), f"Failed to clear UV channel 99 for {obj.name} prior to unwrapping"
+        assert not rt.polyop.getMapSupport(
+            obj, 99
+        ), f"Failed to clear UV channel 99 for {obj.name} prior to unwrapping"
         if USE_UNWRELLA:
-            self.uv_unwrapping_unwrella(obj)
-            if not rt.polyop.getMapSupport(obj, 99):
-                print(f"Unwrella failed for {obj.name}, falling back to native unwrapping.")
-                self.uv_unwrapping_native(obj)
+            try:
+                self.uv_unwrapping_unwrella(obj)
+                if not rt.polyop.getMapSupport(obj, 99):
+                    raise ValueError("Unwrella failed to unwrap the object.")
+            except Exception as e:
+                if USE_NATIVE_UNWRAPPING_ON_ERROR:
+                    print(
+                        f"Unwrella failed for {obj.name} with error {e}, falling back to native unwrapping."
+                    )
+                    self.uv_unwrapping_native(obj)
+                else:
+                    raise e
         else:
             self.uv_unwrapping_native(obj)
-        assert rt.polyop.getMapSupport(obj, 99), f"Could not unwrap UVs for object {obj.name}"
+        assert rt.polyop.getMapSupport(
+            obj, 99
+        ), f"Could not unwrap UVs for object {obj.name}"
+        rt.polyop.setFaceSelection(obj, rt.name("all"))
 
         # Flatten the modifier stack
         rt.maxOps.collapseNodeTo(obj, 1, True)
@@ -266,7 +291,7 @@ class TextureBaker:
             rt.classOf(obj.material) == rt.Shell_Material
             and obj.material.renderMtlIndex == 1
         ):
-            print(f"Skipping baking for {obj.name} as it is already baked.")
+            # print(f"Skipping baking for {obj.name} as it is already baked.")
             return
 
         # Also skip objects whose material is not some kind of a Vray material
@@ -277,27 +302,21 @@ class TextureBaker:
         # Get the existing baseobject children that use the same material as this one
         siblings = []
         for candidate in rt.objects:
-            if (
-                candidate.baseObject
-                == obj.baseObject
-                # and candidate.material == obj.material  # TODO: Is this too aggressive?
-            ):
+            if candidate.baseObject == obj.baseObject:
                 siblings.append(candidate)
 
         # Disconnect the existing baked material
         if rt.classOf(obj.material) == rt.Shell_Material:
             obj.material = obj.material.originalMaterial
 
-        print("prepare_texture_baking", obj.name)
+        # print("prepare_texture_baking", obj.name)
 
         for i, map_name in enumerate(CHANNEL_MAPPING.keys()):
             texture_map = btt.addMapByClassId(obj, self.MAP_NAME_TO_IDS[map_name])
 
             # Only the first channel requires creating the new PhysicalMaterial
             if i == 0:
-                btt.setOutputTo(
-                    obj, "CreateNewMaterial", material=rt.VrayMtl()
-                )
+                btt.setOutputTo(obj, "CreateNewMaterial", material=rt.VrayMtl())
                 # btt.setOutputTo(obj, "CreateNewMaterial", material=rt.PBRMetalRough())
 
             # Make sure the new UV channel is selected
@@ -314,7 +333,10 @@ class TextureBaker:
             texture_map.fileType = CHANNEL_DATA_FORMAT_OVERRIDES.get(map_name, "png")
 
             # Set the apply color mapping option
-            if texture_map.getOptionsCount() > 0 and texture_map.getOptionName(1) == "Apply color mapping":
+            if (
+                texture_map.getOptionsCount() > 0
+                and texture_map.getOptionName(1) == "Apply color mapping"
+            ):
                 texture_map.setOptionValue(1, False)
 
             # Mapping from the original channel (of VRay, Corona, etc) to the new channel of PhysicalMaterial
@@ -359,9 +381,8 @@ class TextureBaker:
         start_time = time.time()
         print("start baking")
         assert btt.bake(), "baking failed"
-        print("finish baking")
         end_time = time.time()
-        print(f"baking took {end_time - start_time} seconds")
+        print(f"finish baking. baking took {end_time - start_time} seconds")
 
         # Clear the baking list again.
         btt.deleteAllMaps()
@@ -377,9 +398,10 @@ class TextureBaker:
         btt.deleteAllMaps()
 
         objs = self.get_process_objs()
+        print(f"Found {len(objs)} objects to process.")
         postprocessing = []  # (obj, siblings)
         for i, obj in enumerate(objs):
-            print(f"{(i + 1)} / {len(objs)}: {obj.name}")
+            # print(f"{(i + 1)} / {len(objs)}: {obj.name}")
 
             rt.select([obj])
             rt.IsolateSelection.EnterIsolateSelectionMode()
